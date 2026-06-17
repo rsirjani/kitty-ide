@@ -1,0 +1,522 @@
+diff --git a/src/cli/cli.rs b/src/cli/cli.rs
+index fc977b7..79c8912 100644
+--- a/src/cli/cli.rs
++++ b/src/cli/cli.rs
+@@ -9,6 +9,7 @@ pub struct CommandLine {
+     pub zoom: f32,
+     pub debug: bool,
+     pub bitmap: bool,
++    pub graphics: bool,
+     pub program: CommandLineProgram,
+     pub shell_mode: bool,
+ }
+@@ -16,6 +17,7 @@ pub struct CommandLine {
+ pub enum EnvVar {
+     Debug,
+     Bitmap,
++    Graphics,
+     ShellMode,
+ }
+ 
+@@ -24,6 +26,7 @@ impl EnvVar {
+         match self {
+             EnvVar::Debug => "CARBONYL_ENV_DEBUG",
+             EnvVar::Bitmap => "CARBONYL_ENV_BITMAP",
++            EnvVar::Graphics => "CARBONYL_ENV_GRAPHICS",
+             EnvVar::ShellMode => "CARBONYL_ENV_SHELL_MODE",
+         }
+     }
+@@ -41,6 +44,7 @@ impl CommandLine {
+         let mut zoom = 1.0;
+         let mut debug = false;
+         let mut bitmap = false;
++        let mut graphics = false;
+         let mut shell_mode = false;
+         let mut program = CommandLineProgram::Main;
+         let args = env::args().skip(1).collect::<Vec<String>>();
+@@ -77,6 +81,14 @@ impl CommandLine {
+                 "-z" | "--zoom" => set_f32!(zoom = zoom / 100.0),
+                 "-d" | "--debug" => set!(debug, Debug),
+                 "-b" | "--bitmap" => set!(bitmap, Bitmap),
++                // Graphics mode renders the page through the kitty graphics
++                // protocol. It requires the full page (including text) in the
++                // framebuffer, which is exactly what bitmap mode produces, so
++                // it implies bitmap rendering.
++                "-g" | "--graphics" => {
++                    set!(graphics, Graphics);
++                    set!(bitmap, Bitmap);
++                }
+ 
+                 "-h" | "--help" => program = CommandLineProgram::Help,
+                 "-v" | "--version" => program = CommandLineProgram::Version,
+@@ -92,6 +104,11 @@ impl CommandLine {
+             bitmap = true;
+         }
+ 
++        if env::var(EnvVar::Graphics).is_ok() {
++            graphics = true;
++            bitmap = true;
++        }
++
+         if env::var(EnvVar::ShellMode).is_ok() {
+             shell_mode = true;
+         }
+@@ -102,6 +119,7 @@ impl CommandLine {
+             zoom,
+             debug,
+             bitmap,
++            graphics,
+             program,
+             shell_mode,
+         }
+diff --git a/src/cli/usage.txt b/src/cli/usage.txt
+index 5a2083d..c5235e8 100644
+--- a/src/cli/usage.txt
++++ b/src/cli/usage.txt
+@@ -10,6 +10,7 @@ Options:
+     -f, --fps=<fps>            set the maximum number of frames per second (default: 60)
+     -z, --zoom=<zoom>          set the zoom level in percent (default: 100)
+     -b, --bitmap               render text as bitmaps
++    -g, --graphics             render at full resolution using the kitty graphics protocol
+     -d, --debug                enable debug logs
+     -h, --help                 display this help message
+     -v, --version              output the version number
+diff --git a/src/output.rs b/src/output.rs
+index 9d16b5f..f32b4ab 100644
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -2,6 +2,7 @@
+ // mod quantizer;
+ mod cell;
+ mod frame_sync;
++mod graphics;
+ mod painter;
+ mod quad;
+ mod render_thread;
+@@ -11,6 +12,7 @@ mod xterm;
+ 
+ pub use cell::*;
+ pub use frame_sync::*;
++pub use graphics::*;
+ pub use painter::*;
+ pub use quad::*;
+ pub use render_thread::*;
+diff --git a/src/output/graphics.rs b/src/output/graphics.rs
+new file mode 100644
+index 0000000..426aebf
+--- /dev/null
++++ b/src/output/graphics.rs
+@@ -0,0 +1,169 @@
++use std::io::{self, Write};
++
++use crate::gfx::Size;
++
++/// Renders the browser framebuffer to the terminal using the kitty graphics
++/// protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/
++///
++/// The default renderer downsamples every 2x4 pixel block to a single terminal
++/// cell and quantizes it to two colors (see `quad.rs`), which is what makes the
++/// output look blocky. On terminals that implement the kitty graphics protocol
++/// we can instead hand the raw framebuffer to the terminal, which composites it
++/// at full pixel resolution — crisp text and images, straight from Blink.
++///
++/// This requires the page (including text) to be present in the framebuffer,
++/// so graphics mode implies bitmap mode (see `Bridge::BitmapMode`).
++pub struct KittyGraphics {
++    /// Latest framebuffer, packed as RGB (3 bytes per pixel).
++    rgb: Vec<u8>,
++    /// Size of the framebuffer in pixels.
++    pixels: Size,
++    /// Whether the framebuffer changed since the last `encode`.
++    dirty: bool,
++    /// Rotating counter for unique temp-file names.
++    counter: u64,
++    /// Recently written temp files, reaped once the terminal has read them.
++    recent: std::collections::VecDeque<String>,
++}
++
++impl KittyGraphics {
++    pub fn new() -> Self {
++        KittyGraphics {
++            rgb: Vec::new(),
++            pixels: Size::new(0, 0),
++            dirty: false,
++            counter: 0,
++            recent: std::collections::VecDeque::new(),
++        }
++    }
++
++    pub fn dirty(&self) -> bool {
++        self.dirty
++    }
++
++    /// Store a new framebuffer. `pixels` is BGRA8888, as handed to us by
++    /// Chromium in `Renderer::draw_background`.
++    pub fn store(&mut self, pixels: &[u8], size: Size) {
++        let count = (size.width as usize) * (size.height as usize);
++
++        if count == 0 || pixels.len() < count * 4 {
++            return;
++        }
++
++        self.rgb.clear();
++        self.rgb.reserve(count * 3);
++
++        for i in 0..count {
++            // Source is BGRA, kitty's RGB format (f=24) wants R, G, B.
++            self.rgb.push(pixels[i * 4 + 2]);
++            self.rgb.push(pixels[i * 4 + 1]);
++            self.rgb.push(pixels[i * 4 + 0]);
++        }
++
++        self.pixels = size;
++        self.dirty = true;
++    }
++
++    /// Tell the terminal to forget our image and its data. Used on resize so a
++    /// stale placement isn't left scaled to the wrong size. Scoped to image
++    /// id 1 (`d=I,i=1`) so we never touch images other programs may have drawn.
++    pub fn reset() -> &'static [u8] {
++        b"\x1b_Ga=d,d=I,i=1\x1b\\"
++    }
++
++    /// Encode the escape codes that draw the framebuffer into a `cols`x`rows`
++    /// cell box anchored at the 1-based terminal cell (`col`, `row`). The cursor
++    /// is saved and restored so the navigation caret is left untouched.
++    ///
++    /// The framebuffer is handed to the terminal through a temporary file
++    /// (`t=t`) rather than base64'd inline: a single page can be several
++    /// megabytes, and pushing that through the pty every frame is the main
++    /// source of latency. The terminal reads and deletes the file itself.
++    pub fn encode(&mut self, col: u32, row: u32, cols: u32, rows: u32) -> io::Result<Vec<u8>> {
++        let mut out = Vec::new();
++
++        self.dirty = false;
++
++        if self.pixels.width == 0 || self.pixels.height == 0 {
++            return Ok(out);
++        }
++
++        self.counter = self.counter.wrapping_add(1);
++        let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
++        // The name must contain "tty-graphics-protocol" for kitty to delete the
++        // file itself after reading it.
++        let path = format!(
++            "{}/carbonyl-tty-graphics-protocol-{}-{}.rgb",
++            dir.trim_end_matches('/'),
++            std::process::id(),
++            self.counter
++        );
++
++        std::fs::write(&path, &self.rgb)?;
++
++        // Reap files from earlier frames in case the terminal didn't (e.g. it
++        // isn't kitty, or doesn't honor t=t deletion). By now they've been read.
++        self.recent.push_back(path.clone());
++        while self.recent.len() > 2 {
++            if let Some(old) = self.recent.pop_front() {
++                let _ = std::fs::remove_file(old);
++            }
++        }
++
++        // Save cursor, move to the content origin.
++        write!(out, "\x1b7\x1b[{};{}H", row, col)?;
++
++        // a=T  transmit and display
++        // f=24 raw RGB
++        // t=t  payload is the path to a temporary file the terminal deletes
++        // s,v  source size in pixels
++        // c,r  number of cells to scale the image into
++        // i=1  image id (reused each frame, so the terminal replaces the data)
++        // p=1  placement id (reused, so the terminal replaces the placement)
++        // q=2  suppress the terminal's success/error replies
++        // C=1  do not move the cursor when placing the image
++        write!(
++            out,
++            "\x1b_Ga=T,f=24,t=t,s={},v={},c={},r={},i=1,p=1,q=2,C=1;{}\x1b\\",
++            self.pixels.width,
++            self.pixels.height,
++            cols,
++            rows,
++            base64(path.as_bytes())
++        )?;
++
++        // Restore the cursor.
++        write!(out, "\x1b8")?;
++
++        Ok(out)
++    }
++}
++
++/// Standard base64 (RFC 4648) encoder. Kept inline to avoid pulling in a crate.
++fn base64(data: &[u8]) -> String {
++    const ALPHABET: &[u8; 64] =
++        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
++
++    for chunk in data.chunks(3) {
++        let n = ((chunk[0] as u32) << 16)
++            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
++            | (*chunk.get(2).unwrap_or(&0) as u32);
++
++        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
++        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
++        out.push(if chunk.len() > 1 {
++            ALPHABET[((n >> 6) & 63) as usize] as char
++        } else {
++            '='
++        });
++        out.push(if chunk.len() > 2 {
++            ALPHABET[(n & 63) as usize] as char
++        } else {
++            '='
++        });
++    }
++
++    out
++}
+diff --git a/src/output/renderer.rs b/src/output/renderer.rs
+index f515cad..37614b1 100644
+--- a/src/output/renderer.rs
++++ b/src/output/renderer.rs
+@@ -7,19 +7,24 @@ use unicode_segmentation::UnicodeSegmentation;
+ use unicode_width::UnicodeWidthStr;
+ 
+ use crate::{
++    cli::CommandLine,
+     gfx::{Color, Point, Rect, Size},
+     input::Key,
+     ui::navigation::{Navigation, NavigationAction},
+     utils::log,
+ };
+ 
+-use super::{Cell, Grapheme, Painter};
++use super::{Cell, Grapheme, KittyGraphics, Painter};
+ 
+ pub struct Renderer {
+     nav: Navigation,
+     cells: Vec<(Cell, Cell)>,
+     painter: Painter,
+     size: Size,
++    /// Kitty graphics backend, present only in `--graphics` mode. When set, the
++    /// page is drawn from the framebuffer via the kitty graphics protocol
++    /// instead of the quadrant glyphs.
++    graphics: Option<KittyGraphics>,
+ }
+ 
+ impl Renderer {
+@@ -29,6 +34,11 @@ impl Renderer {
+             cells: Vec::with_capacity(0),
+             painter: Painter::new(),
+             size: Size::new(0, 0),
++            graphics: if CommandLine::parse().graphics {
++                Some(KittyGraphics::new())
++            } else {
++                None
++            },
+         }
+     }
+ 
+@@ -69,6 +79,14 @@ impl Renderer {
+         self.nav.set_size(size);
+         self.size = size;
+ 
++        // Drop any image we transmitted at the old size so the terminal doesn't
++        // keep a stale placement around while we redraw at the new size.
++        if self.graphics.is_some() {
++            let mut stdout = io::stdout();
++            let _ = stdout.write_all(KittyGraphics::reset());
++            let _ = stdout.flush();
++        }
++
+         let mut x = 0;
+         let mut y = 0;
+         let bound = size.width - 1;
+@@ -120,11 +138,31 @@ impl Renderer {
+ 
+         self.painter.end(self.nav.cursor())?;
+ 
++        // In graphics mode the page lives in the framebuffer rather than in the
++        // cells: blit it via the kitty graphics protocol. The navigation bar
++        // occupies row 1, so the page fills the rest starting at row 2.
++        let (width, height) = (self.size.width, self.size.height);
++        if let Some(graphics) = &mut self.graphics {
++            if graphics.dirty() {
++                let bytes = graphics.encode(1, 2, width, height)?;
++                let mut stdout = io::stdout();
++                stdout.write_all(&bytes)?;
++                stdout.flush()?;
++            }
++        }
++
+         Ok(())
+     }
+ 
+     /// Draw the background from a pixel array encoded in RGBA8888
+     pub fn draw_background(&mut self, pixels: &[u8], pixels_size: Size, rect: Rect) {
++        // Graphics mode: keep the raw framebuffer and let the kitty protocol
++        // render it at full resolution instead of downsampling to quadrants.
++        if let Some(graphics) = &mut self.graphics {
++            graphics.store(pixels, pixels_size);
++            return;
++        }
++
+         let viewport = self.size.cast::<usize>();
+ 
+         if pixels.len() < viewport.width * viewport.height * 8 * 4 {
+diff --git a/src/output/window.rs b/src/output/window.rs
+index a53c507..912e556 100644
+--- a/src/output/window.rs
++++ b/src/output/window.rs
+@@ -50,6 +50,9 @@ impl Window {
+             }
+         };
+ 
++        // Whether the terminal reported real cell pixel dimensions (kitty does).
++        let pixel_known = cell.width > 0 && cell.height > 0;
++
+         if cell.width == 0 || cell.height == 0 {
+             cell.width = 8;
+             cell.height = 16;
+@@ -89,9 +92,31 @@ impl Window {
+         let cell_width = (cell_pixels.width + cell_pixels.height / 2.0) / 2.0;
+ 
+         // Round DPI to 2 decimals for proper viewport computations
+-        self.dpi = (2.0 / cell_width * zoom * 100.0).ceil() / 100.0;
+-        // A virtual cell should contain a 2x4 pixel quadrant
+-        self.scale = Size::new(2.0, 4.0) / self.dpi;
++        let dpi = (2.0 / cell_width * zoom * 100.0).ceil() / 100.0;
++        // In graphics mode the framebuffer is shown at full pixel resolution via
++        // the kitty protocol, so render it at a higher device-pixel-ratio for a
++        // crisp result. Scaling both the DPI and the per-cell pixel size by the
++        // same factor keeps the page layout identical while quadrupling the
++        // pixels behind each cell.
++        let supersample = if self.cmd.graphics { 2.0 } else { 1.0 };
++        // Device pixel ratio reported to Chromium
++        self.dpi = dpi * supersample;
++        // A virtual cell should contain a 2x4 pixel quadrant (times supersample)
++        self.scale = Size::new(2.0, 4.0) / (dpi / supersample);
++
++        // In graphics mode the framebuffer is scaled to fill the cell box. The
++        // 2x4 quadrant assumes a 1:2 cell, but real terminal cells are usually
++        // taller than that, which stretches the image vertically. Match the
++        // framebuffer's aspect ratio to the reported cell so it isn't distorted.
++        if self.cmd.graphics && pixel_known {
++            let cell_w = cell.width as f32 / term.width.max(1) as f32;
++            let cell_h = cell.height as f32 / term.height.max(1) as f32;
++
++            if cell_w > 0.0 && cell_h > 0.0 {
++                self.scale.height = self.scale.width * (cell_h / cell_w);
++            }
++        }
++
+         // Keep some space for the UI
+         self.cells = Size::new(term.width.max(1), term.height.max(2) - 1).cast();
+         self.browser = self.cells.cast::<f32>().mul(self.scale).ceil().cast();
+diff --git a/src/ui/navigation.rs b/src/ui/navigation.rs
+index 97d669b..3e6662f 100644
+--- a/src/ui/navigation.rs
++++ b/src/ui/navigation.rs
+@@ -63,8 +63,8 @@ impl Navigation {
+                 if let Some(url) = &mut self.url {
+                     // TODO: Unicode
+                     match key.char {
+-                        // Return
+-                        0x0d => return NavigationAction::GoTo(url.clone()),
++                        // Return (CR or LF)
++                        0x0d | 0x0a => return NavigationAction::GoTo(resolve_url(url)),
+                         // Up
+                         0x11 => self.cursor = Some(0),
+                         // Down
+@@ -219,3 +219,90 @@ impl Navigation {
+         elements
+     }
+ }
++
++/// Turn what the user typed in the address bar into something Chromium can load,
++/// the way a browser omnibox does: keep anything that already has a scheme,
++/// assume `https://` for a bare host like `youtube.com`, and send everything
++/// else to a search engine. Without this, typing `youtube.com` and pressing
++/// Return does nothing, because the raw string isn't a valid URL.
++fn resolve_url(input: &str) -> String {
++    let trimmed = input.trim();
++
++    if trimmed.is_empty() {
++        return "about:blank".to_owned();
++    }
++
++    // Already a full URL or a special scheme: load it verbatim.
++    if trimmed.contains("://")
++        || trimmed.starts_with("about:")
++        || trimmed.starts_with("data:")
++        || trimmed.starts_with("file:")
++    {
++        return trimmed.to_owned();
++    }
++
++    // A bare host such as `youtube.com`, `localhost` or `localhost:3000`.
++    let host = trimmed.split(['/', '?', '#']).next().unwrap_or(trimmed);
++    let host_only = host.split(':').next().unwrap_or(host);
++    let looks_like_host =
++        !trimmed.contains(' ') && (host_only.contains('.') || host_only == "localhost");
++
++    if looks_like_host {
++        format!("https://{trimmed}")
++    } else {
++        format!("https://duckduckgo.com/?q={}", percent_encode(trimmed))
++    }
++}
++
++/// Percent-encode a search query for use in a URL.
++fn percent_encode(input: &str) -> String {
++    let mut out = String::with_capacity(input.len());
++
++    for byte in input.bytes() {
++        match byte {
++            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
++                out.push(byte as char)
++            }
++            b' ' => out.push('+'),
++            _ => out.push_str(&format!("%{byte:02X}")),
++        }
++    }
++
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::resolve_url;
++
++    #[test]
++    fn keeps_full_urls() {
++        assert_eq!(resolve_url("https://youtube.com"), "https://youtube.com");
++        assert_eq!(resolve_url("http://example.com/x"), "http://example.com/x");
++        assert_eq!(resolve_url("about:blank"), "about:blank");
++        assert_eq!(resolve_url("file:///etc/hosts"), "file:///etc/hosts");
++    }
++
++    #[test]
++    fn assumes_https_for_bare_hosts() {
++        assert_eq!(resolve_url("youtube.com"), "https://youtube.com");
++        assert_eq!(resolve_url("youtube.com/watch?v=1"), "https://youtube.com/watch?v=1");
++        assert_eq!(resolve_url("localhost"), "https://localhost");
++        assert_eq!(resolve_url("localhost:3000"), "https://localhost:3000");
++        assert_eq!(resolve_url("  arxiv.org  "), "https://arxiv.org");
++    }
++
++    #[test]
++    fn searches_plain_text() {
++        assert_eq!(
++            resolve_url("hello world"),
++            "https://duckduckgo.com/?q=hello+world"
++        );
++        assert_eq!(resolve_url("rust"), "https://duckduckgo.com/?q=rust");
++    }
++
++    #[test]
++    fn empty_is_blank() {
++        assert_eq!(resolve_url("   "), "about:blank");
++    }
++}

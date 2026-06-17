@@ -1,0 +1,34 @@
+# yazi config for the kitty IDE explorer pane only (launched via
+# YAZI_CONFIG_HOME=~/.config/yazi-ide). Your normal `yazi` is untouched.
+#
+# Behavior:
+#   - text/code  -> opened as a TAB in the single shared nvim (--remote-tab),
+#                   then focus jumps to the editor window.
+#   - PDF        -> opened embedded over the editor as a kpdf overlay (kitty graphics).
+
+[mgr]
+ratio          = [0, 1, 0]   # single column: fits a narrow explorer pane
+show_hidden    = true
+sort_dir_first = true
+linemode       = "none"
+
+[opener]
+edit = [
+  { run = 'ide-open edit "$@"', desc = "edit (nvim tab)", block = false, for = "unix" },
+]
+pdf = [
+  { run = 'ide-open pdf "$@"', desc = "read (kpdf)", orphan = true, for = "unix" },
+]
+
+[open]
+prepend_rules = [
+  { mime = "text/*",                    use = "edit" },
+  { mime = "application/json",          use = "edit" },
+  { mime = "application/javascript",    use = "edit" },
+  { mime = "application/x-shellscript", use = "edit" },
+  { mime = "application/x-tex",         use = "edit" },
+  { mime = "inode/x-empty",             use = "edit" },
+  { url = "*.tex",                      use = "edit" },
+  { url = "*.md",                       use = "edit" },
+  { mime = "application/pdf",           use = "pdf"  },
+]

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+# Interactive tab bar for the kitty IDE. Lists document overlays (var doc=1),
+# highlights the focused one, switches to a tab on click, and closes one via its
+# "×". Runs in the thin "tabbar" pane on top of the editor column, and keeps
+# itself pinned to a single row so it stays fixed-height as the editor resizes.
+import sys, os, json, subprocess, select, re
+
+ACTIVE_FG, ACTIVE_BG = "#1e1e2e", "#89b4fa"   # blue chip for the active doc
+IDLE_FG, SEP_FG      = "#a6adc8", "#585b70"
+BTN_FG, BTN_BG       = "#1e1e2e", "#a6e3a1"   # green chip for the "+ web" button
+CLOSE_FG             = "#f38ba8"              # red "×" close glyph
+
+NEW_BROWSER = "__newbrowser__"
+
+def fg(h): r,g,b=(int(h[i:i+2],16) for i in (1,3,5)); return f"\033[38;2;{r};{g};{b}m"
+def bg(h): r,g,b=(int(h[i:i+2],16) for i in (1,3,5)); return f"\033[48;2;{r};{g};{b}m"
+RST = "\033[0m"
+
+def kitty(*args):
+    try:
+        return subprocess.run(["kitty","@",*args], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return None
+
+def snapshot():
+    """One `kitty @ ls` -> (docs list, this tabbar's (rows, cols))."""
+    r = kitty("ls"); docs = []; tb_dims = (None, None)
+    if not r or not r.stdout: return docs, tb_dims
+    try: data = json.loads(r.stdout)
+    except Exception: return docs, tb_dims
+    for w in data:
+        for t in w.get("tabs", []):
+            for win in t.get("windows", []):
+                v = win.get("user_vars", {})
+                if v.get("doc") == "1":
+                    docs.append((win["id"], v.get("title", "?"), bool(win.get("is_focused"))))
+                if v.get("pane") == "tabbar":
+                    tb_dims = (win.get("lines"), win.get("columns"))
+    return docs, tb_dims
+
+def pin_one_row(tb_lines):
+    """Keep the tab bar exactly one row tall; give the freed space to the editor."""
+    if tb_lines and tb_lines > 1:
+        kitty("resize-window", "--axis", "vertical",
+              "--increment", str(1 - tb_lines), "--match", "var:pane=tabbar")
+
+def render(ds):
+    sys.stdout.write("\033[H\033[2J")
+    ranges, col = [], 1
+    if not ds:
+        msg = "  open a file from the explorer  "
+        sys.stdout.write(fg(IDLE_FG) + msg + RST); col += len(msg)
+    else:
+        for wid, title, foc in ds:
+            label = f" {title} "
+            start = col
+            if foc:
+                sys.stdout.write(bg(ACTIVE_BG) + fg(ACTIVE_FG) + label + RST)
+            else:
+                sys.stdout.write(fg(IDLE_FG) + label + RST)
+            col += len(label)
+            ranges.append((start, col, "focus", wid))
+            # per-tab close button ("× ")
+            cl = "× "
+            cstart = col
+            if foc:
+                sys.stdout.write(bg(ACTIVE_BG) + fg(CLOSE_FG) + cl + RST)
+            else:
+                sys.stdout.write(fg(CLOSE_FG) + cl + RST)
+            col += len(cl)
+            ranges.append((cstart, col, "close", wid))
+            sys.stdout.write(fg(SEP_FG) + "│" + RST); col += 1
+    # "+ web" button (ASCII so click columns stay exact); click opens carbonyl
+    btn = " + web "
+    start = col
+    sys.stdout.write(bg(BTN_BG) + fg(BTN_FG) + btn + RST)
+    col += len(btn)
+    ranges.append((start, col, "newbrowser", None))
+    sys.stdout.flush()
+    return ranges
+
+def focus(wid):
+    kitty("focus-window", "--match", f"id:{wid}")
+    try: open("/tmp/ide-active-doc", "w").write(str(wid))   # for ide-pane "editor"
+    except Exception: pass
+
+def close(wid):
+    kitty("close-window", "--match", f"id:{wid}")
+    try:
+        if open("/tmp/ide-active-doc").read().strip() == str(wid):
+            os.remove("/tmp/ide-active-doc")
+    except Exception: pass
+
+def main():
+    # cbreak mode: read mouse bytes immediately (not line-buffered) and hide the cursor
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old_attr = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    sys.stdout.write("\033]2;tabbar\033\\")     # window title
+    sys.stdout.write("\033[?25l")                 # hide cursor
+    sys.stdout.write("\033[?1000;1006h")          # SGR mouse reporting
+    sys.stdout.flush()
+    last, last_dims, ranges, buf = None, None, [], ""
+    while True:
+        r, _, _ = select.select([sys.stdin], [], [], 0.1)
+        cur, tb_dims = snapshot()
+        if tb_dims != last_dims:                  # the bar was resized
+            pin_one_row(tb_dims[0])               # snap it back to one row
+            last_dims = tb_dims
+            last = None                           # force a redraw (don't go blank)
+        if cur != last:
+            ranges = render(cur); last = cur
+        if r:
+            try: data = os.read(sys.stdin.fileno(), 4096).decode("utf-8", "replace")
+            except OSError: data = ""
+            buf += data
+            for mt in re.finditer(r"\033\[<(\d+);(\d+);(\d+)([Mm])", buf):
+                b, x, _, typ = int(mt.group(1)), int(mt.group(2)), mt.group(3), mt.group(4)
+                if typ == "M" and b == 0:          # left button press
+                    for s, e, kind, wid in ranges:
+                        if s <= x < e:
+                            if kind == "newbrowser":
+                                subprocess.Popen(["ide-open", "browser"])
+                            elif kind == "close":
+                                close(wid)
+                            else:
+                                focus(wid)
+                            last = None; break
+            buf = ""
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: pass

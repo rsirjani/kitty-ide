@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Open content as a TAB (kitty overlay) in the IDE editor pane.
+#   ide-open edit  <file>   -> nvim
+#   ide-open pdf   <file>   -> tdf (fast PDF reader)
+#   ide-open browser [url]  -> carbonyl (in-terminal browser)
+export PATH="$HOME/.local/bin:$PATH"
+sock="unix:$(find /tmp -maxdepth 1 -name 'ide.sock-*' 2>/dev/null | head -1)"
+mode="${1:-edit}"; arg="${2:-}"
+
+# focus the content pane so the overlay covers exactly that region
+kitty @ --to "$sock" focus-window --match var:pane=content >/dev/null 2>&1
+
+case "$mode" in
+  edit)
+    [ -n "$arg" ] || exit 0
+    id=$(kitty @ --to "$sock" launch --type=overlay --cwd="$(dirname "$arg")" \
+      --var doc=1 --var title="$(basename "$arg")" nvim "$arg" 2>/dev/null) ;;
+  pdf)
+    [ -n "$arg" ] || exit 0
+    if command -v tdf >/dev/null; then prog=tdf; else prog=kpdf; fi
+    id=$(kitty @ --to "$sock" launch --type=overlay --cwd="$(dirname "$arg")" \
+      --var doc=1 --var title="$(basename "$arg")" "$prog" "$arg" 2>/dev/null) ;;
+  browser)
+    url="${arg:-https://arxiv.org}"
+    # --graphics: render the page crisply via kitty's graphics protocol
+    # (patched libcarbonyl) instead of blocky half-blocks.
+    id=$(kitty @ --to "$sock" launch --type=overlay \
+      --var doc=1 --var title="🌐 web" carbonyl --graphics "$url" 2>/dev/null) ;;
+esac
+
+[ -n "$id" ] && echo "$id" > /tmp/ide-active-doc   # remember the active document for ide-pane
+touch /tmp/ide-tabs-dirty

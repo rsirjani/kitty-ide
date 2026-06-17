@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Single-window IDE with a custom per-pane tab system.
+#   explorer | [ tab-bar / content ] | claude
+# Documents open as overlays over the content pane; the tab-bar switches them.
+export PATH="$HOME/.local/bin:$PATH"
+mkdir -p "$HOME/.cache/ide-shots"
+rm -f /tmp/ide.sock-* /tmp/ide-tabs-dirty 2>/dev/null
+exec kitty --class ide --config "$HOME/.config/kitty/ide.conf" \
+  -o allow_remote_control=yes -o listen_on=unix:/tmp/ide.sock \
+  -o confirm_os_window_close=0 --title "IDE" \
+  --session "$HOME/.config/kitty/ide.session"

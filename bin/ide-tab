@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Switch/close document tabs by keybind:  ide-tab next | prev | close | <N>
+export PATH="$HOME/.local/bin:$PATH"
+sock="unix:$(find /tmp -maxdepth 1 -name 'ide.sock-*' 2>/dev/null | head -1)"
+action="${1:-next}"
+
+if [ "$action" = "close" ]; then
+  # close the focused document overlay, then focus the previous tab if any
+  read -r closed nextid < <(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
+import sys,json
+ids=[]; foc=None
+for w in json.load(sys.stdin):
+ for t in w['tabs']:
+  for win in t['windows']:
+   if win.get('user_vars',{}).get('doc')=='1':
+    ids.append(win['id'])
+    if win.get('is_focused'): foc=win['id']
+if foc in ids:
+ i=ids.index(foc); rest=[x for x in ids if x!=foc]
+ nxt=rest[i-1] if rest else ''
+ print(foc, nxt)
+")
+  if [ -n "$closed" ]; then
+    kitty @ --to "$sock" close-window --match "id:$closed" >/dev/null 2>&1
+    if [ -n "$nextid" ]; then
+      kitty @ --to "$sock" focus-window --match "id:$nextid" >/dev/null 2>&1
+      echo "$nextid" > /tmp/ide-active-doc
+    else
+      rm -f /tmp/ide-active-doc
+    fi
+  fi
+  exit 0
+fi
+
+target=$(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
+import sys,json
+ids=[]; foc=None
+for w in json.load(sys.stdin):
+ for t in w['tabs']:
+  for win in t['windows']:
+   if win.get('user_vars',{}).get('doc')=='1':
+    ids.append(win['id'])
+    if win.get('is_focused'): foc=win['id']
+if not ids: print(''); raise SystemExit
+a='$action'
+if a=='next': i=(ids.index(foc)+1)%len(ids) if foc in ids else 0
+elif a=='prev': i=(ids.index(foc)-1)%len(ids) if foc in ids else 0
+else: i=int(a)-1 if a.isdigit() and 0<int(a)<=len(ids) else 0
+print(ids[i])
+")
+[ -n "$target" ] && { kitty @ --to "$sock" focus-window --match "id:$target" >/dev/null 2>&1; echo "$target" > /tmp/ide-active-doc; }

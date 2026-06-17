@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Switch focus between IDE panes:  ide-pane explorer | editor | claude | next | prev
+# "editor" focuses the active document overlay (tracked in /tmp/ide-active-doc).
+export PATH="$HOME/.local/bin:$PATH"
+sock="unix:$(find /tmp -maxdepth 1 -name 'ide.sock-*' 2>/dev/null | head -1)"
+curpane=$(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
+import sys,json
+for w in json.load(sys.stdin):
+ for t in w['tabs']:
+  for win in t['windows']:
+   if win.get('is_focused'):
+    v=win.get('user_vars',{}); p=v.get('pane','')
+    if v.get('doc')=='1' or p in ('content','tabbar'): p='editor'
+    print(p); raise SystemExit
+print('')
+")
+order=(explorer editor claude); idx=1
+for i in 0 1 2; do [ "${order[$i]}" = "$curpane" ] && idx=$i; done
+case "$1" in
+  next) target="${order[$(((idx+1)%3))]}" ;;
+  prev) target="${order[$(((idx+2)%3))]}" ;;
+  *)    target="$1" ;;
+esac
+if [ "$target" = editor ]; then
+  doc="$(cat /tmp/ide-active-doc 2>/dev/null)"
+  if ! { [ -n "$doc" ] && kitty @ --to "$sock" focus-window --match "id:$doc" >/dev/null 2>&1; }; then
+    kitty @ --to "$sock" focus-window --match var:pane=content >/dev/null 2>&1
+  fi
+else
+  kitty @ --to "$sock" focus-window --match var:pane="$target" >/dev/null 2>&1
+fi

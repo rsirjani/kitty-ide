@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Follow the IDE explorer's directory in the claude terminal.
+#
+# yazi writes its cwd to /tmp/ide-explorer-cwd on every cd (see
+# ~/.config/yazi-ide/init.lua). When it changes, cd the claude pane to match --
+# but ONLY when that pane is sitting at a shell prompt. If a claude session (or
+# any command) is running there, leave it alone, so we never type into it.
+# Exits automatically when the IDE is closed.
+export PATH="$HOME/.local/bin:$PATH"
+CWDFILE="${IDE_CWD_FILE:-/tmp/ide-explorer-cwd}"
+SOCK_GLOB="${IDE_SOCK_GLOB:-ide.sock-*}"
+last=""
+
+while true; do
+  sock="$(find /tmp -maxdepth 1 -name "$SOCK_GLOB" 2>/dev/null | head -1)"
+  [ -z "$sock" ] && exit 0   # IDE gone -> stop following
+
+  if [ -r "$CWDFILE" ]; then
+    dir="$(cat "$CWDFILE" 2>/dev/null)"
+    if [ -n "$dir" ] && [ "$dir" != "$last" ] && [ -d "$dir" ]; then
+      last="$dir"
+      do_cd=$(kitty @ --to "unix:$sock" ls 2>/dev/null | DIR="$dir" python3 -c '
+import sys, json, os
+target = os.environ["DIR"]
+shells = {"zsh", "bash", "sh", "fish"}
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("0"); sys.exit()
+for w in data:
+    for t in w["tabs"]:
+        for win in t["windows"]:
+            if win.get("user_vars", {}).get("pane") != "claude":
+                continue
+            if win.get("cwd") == target:        # already there
+                print("0"); sys.exit()
+            fps = win.get("foreground_processes", [])
+            if not fps:
+                print("0"); sys.exit()
+            for p in fps:                        # anything but a bare shell = busy
+                cmd = p.get("cmdline") or [""]
+                if os.path.basename(cmd[0]).lstrip("-") not in shells:
+                    print("0"); sys.exit()
+            print("1"); sys.exit()
+print("0")
+')
+      if [ "$do_cd" = "1" ]; then
+        kitty @ --to "unix:$sock" send-text --match var:pane=claude "cd ${dir@Q}"$'\r' >/dev/null 2>&1
+      fi
+    fi
+  fi
+  sleep 0.3
+done

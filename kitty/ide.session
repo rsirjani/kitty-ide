@@ -1,0 +1,25 @@
+# Single-window IDE.  Left column = explorer (top) over the editor zone
+# (tab-bar + content); claude on the right.
+#   ┌─explorer──────┬─────────┐
+#   ├───────────────┤ claude  │
+#   │ tab-bar       │         │
+#   │ content (tab) │         │
+#   └───────────────┴─────────┘
+# Documents open as OVERLAYS over "content"; the tab-bar lists/switches them.
+layout splits
+
+# explorer (will become the top of the left column)
+launch --var pane=explorer --title explorer --cwd=/home/tin/projects bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; setsid ide-cwd-follow >/dev/null 2>&1 & YAZI_CONFIG_HOME=$HOME/.config/yazi-ide exec yazi /home/tin/projects"
+
+# claude on the right (~28% width)
+launch --location=vsplit --bias=28 --var pane=claude --title claude --cwd=/home/tin/projects sh -c 'export NO_ZELLIJ_AUTOSTART=1; exec zsh'
+
+# editor zone BELOW the explorer: tab-bar strip (takes ~75% of the left column height)
+focus_matching_window var:pane=explorer
+launch --location=hsplit --bias=75 --var pane=tabbar --var fixed_lines=1 --var hlgroup=editor --title tabbar --watcher ide-pin-tabbar.py bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-tabbar"
+
+# content fills the rest below the tab-bar (tab-bar stays a thin strip on top)
+focus_matching_window var:pane=tabbar
+launch --location=hsplit --bias=94 --var pane=content --var hlgroup=editor --title content bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-home"
+
+focus_matching_window var:pane=claude

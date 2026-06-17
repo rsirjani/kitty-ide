@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = kitty
+
+[Action]
+Description = Re-applying kitty fixed_lines tab-bar patch...
+When = PostTransaction
+Exec = /usr/bin/python3 /home/tin/.config/kitty/patches/apply-fixed-lines-patch.py
