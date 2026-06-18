@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run the Virtual Desktop feed pane under the ide-vd python venv.
+# (Launched by kitty/ide.session as the `vd` pane process.)
+export PATH="$HOME/.local/bin:$PATH"
+venv="$HOME/.local/share/ide-vd/venv/bin/python"
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+if [ ! -x "$venv" ]; then
+  printf '\n  Virtual Desktop python venv missing.\n  Run: %s\n' \
+    "python3 -m venv ~/.local/share/ide-vd/venv && ~/.local/share/ide-vd/venv/bin/pip install asyncvnc pillow numpy"
+  exec sleep infinity
+fi
+
+exec "$venv" "$here/ide_vd_view.py"

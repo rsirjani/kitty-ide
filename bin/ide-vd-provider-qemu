@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Virtual Desktop provider: a full-OS VM via QEMU's built-in VNC server.
+# Ready to use for Windows / macOS / other-Linux VMs — point an env at a disk
+# image (and optionally an install ISO) and `ide-vd up` it. Nothing is
+# provisioned until you supply an image; QEMU itself must be installed.
+#
+# Contract:  up|down|status|endpoint|run <envfile>
+# Reads from the env file:  disk, iso, memory (MB), cpus, vncport, accel
+set -euo pipefail
+
+action="${1:?}"; envfile="${2:?}"; shift 2 || true
+# shellcheck disable=SC1090
+provider=qemu disk= iso= memory=4096 cpus=2 vncport=5902 accel=kvm
+source "$envfile"
+
+name="ide-vd-$(basename "$envfile" .env)"
+pidfile="$HOME/.cache/ide-vd/$name.pid"
+display=$(( vncport - 5900 ))
+
+alive() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+
+case "$action" in
+  up)
+    alive && exit 0
+    command -v qemu-system-x86_64 >/dev/null || { echo "qemu: install qemu-system-x86_64" >&2; exit 1; }
+    [ -n "$disk" ] && [ -f "$disk" ] || { echo "qemu: env 'disk=' must point at a VM image" >&2; exit 1; }
+    args=(qemu-system-x86_64 -name "$name" -m "$memory" -smp "$cpus"
+          -drive file="$disk",if=virtio
+          -vnc "127.0.0.1:${display}" -usbdevice tablet)   # tablet => absolute mouse
+    [ "$accel" = kvm ] && [ -e /dev/kvm ] && args+=(-enable-kvm -cpu host)
+    [ -n "$iso" ] && args+=(-cdrom "$iso" -boot d)
+    "${args[@]}" >/dev/null 2>&1 &
+    echo $! > "$pidfile"
+    for _ in $(seq 1 150); do
+      if (exec 3<>"/dev/tcp/127.0.0.1/${vncport}") 2>/dev/null; then exec 3>&- 3<&-; exit 0; fi
+      sleep 0.2
+    done
+    echo "qemu: VNC port ${vncport} never came up" >&2; exit 1
+    ;;
+
+  down)
+    alive && kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+    ;;
+
+  status)
+    if alive; then echo up; else echo down; fi
+    ;;
+
+  endpoint)
+    alive && printf '127.0.0.1\t%s\t\n' "$vncport"
+    ;;
+
+  run)
+    echo "qemu: 'run' unsupported — launch apps inside the guest OS" >&2; exit 1
+    ;;
+
+  *) echo "qemu provider: unknown action '$action'" >&2; exit 2 ;;
+esac

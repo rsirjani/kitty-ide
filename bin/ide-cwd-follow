@@ -3,23 +3,26 @@
 #
 # yazi writes its cwd to /tmp/ide-explorer-cwd on every cd (see
 # ~/.config/yazi-ide/init.lua). When it changes, cd the claude pane to match --
-# but ONLY when that pane is sitting at a shell prompt. If a claude session (or
-# any command) is running there, leave it alone, so we never type into it.
-# Exits automatically when the IDE is closed.
+# but ONLY when that pane is sitting at an *empty* shell prompt:
+#   1. its foreground process must be a bare shell (no command/claude running), and
+#   2. there must be no unsubmitted text typed at the prompt.
+# Either way we never type a `cd` into a running program or onto a half-typed
+# command line. Exits automatically when the IDE is closed.
 export PATH="$HOME/.local/bin:$PATH"
-CWDFILE="${IDE_CWD_FILE:-/tmp/ide-explorer-cwd}"
-SOCK_GLOB="${IDE_SOCK_GLOB:-ide.sock-*}"
+. ide-sock                   # -> sock, IDE_CWD_FILE for THIS instance
+CWDFILE="$IDE_CWD_FILE"
+sockpath="${sock#unix:}"     # the control socket's filesystem path
 last=""
 
 while true; do
-  sock="$(find /tmp -maxdepth 1 -name "$SOCK_GLOB" 2>/dev/null | head -1)"
-  [ -z "$sock" ] && exit 0   # IDE gone -> stop following
+  [ -S "$sockpath" ] || exit 0   # THIS IDE gone -> stop following
 
   if [ -r "$CWDFILE" ]; then
     dir="$(cat "$CWDFILE" 2>/dev/null)"
     if [ -n "$dir" ] && [ "$dir" != "$last" ] && [ -d "$dir" ]; then
       last="$dir"
-      do_cd=$(kitty @ --to "unix:$sock" ls 2>/dev/null | DIR="$dir" python3 -c '
+      # Stage 1: is the claude pane an idle bare shell sitting at a different dir?
+      do_cd=$(kitty @ --to "$sock" ls 2>/dev/null | DIR="$dir" python3 -c '
 import sys, json, os
 target = os.environ["DIR"]
 shells = {"zsh", "bash", "sh", "fish"}
@@ -44,8 +47,34 @@ for w in data:
             print("1"); sys.exit()
 print("0")
 ')
+      # Stage 2: idle shell -- but skip if there is unsubmitted text at the prompt.
+      # Scope the screen to the current prompt via its OSC 133;A mark (kitty shell
+      # integration), then take the text after the last prompt symbol as the input
+      # buffer. If marks are unavailable (no shell integration), fall back to the
+      # stage-1 decision rather than regress.
       if [ "$do_cd" = "1" ]; then
-        kitty @ --to "unix:$sock" send-text --match var:pane=claude "cd ${dir@Q}"$'\r' >/dev/null 2>&1
+        typed=$(kitty @ --to "$sock" get-text --match var:pane=claude --extent=screen --ansi 2>/dev/null | python3 -c '
+import sys, re
+s = sys.stdin.read()
+am = list(re.finditer(r"\x1b\]133;A", s))   # prompt-start marks
+if not am:
+    print("NOMARK"); sys.exit()             # no shell-integration marks -> dont gate
+region = s[am[-1].end():]                    # current prompt onward
+region = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", region)  # strip OSC
+region = re.sub(r"\x1b\[[0-9;:?]*[ -/]*[@-~]", "", region)         # strip CSI
+region = re.sub(r"\x1b[()][0-9A-Za-z]", "", region)               # strip charset
+region = region.replace("\x1b\\", "")
+SYMS = "$%#>❯➜λ⛩»→▶฿"  # $ % # > ❯ ➜ λ ⛩ » → ▶ ฿
+idx = max((i for i, ch in enumerate(region) if ch in SYMS), default=-1)
+buf = region[idx+1:] if idx >= 0 else region
+print("TYPED" if buf.strip() else "EMPTY")
+')
+        if [ "$typed" = "TYPED" ]; then
+          do_cd="0"
+        fi
+      fi
+      if [ "$do_cd" = "1" ]; then
+        kitty @ --to "$sock" send-text --match var:pane=claude "cd ${dir@Q}"$'\r' >/dev/null 2>&1
       fi
     fi
   fi

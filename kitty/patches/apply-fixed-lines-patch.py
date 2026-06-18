@@ -17,6 +17,7 @@ import shutil
 import sys
 
 TARGET = "/usr/lib/kitty/kitty/layout/splits.py"
+TARGET_WINDOW = "/usr/lib/kitty/kitty/window.py"
 
 # ---- patch 1: fixed_lines ---------------------------------------------------
 HELPER = '''
@@ -138,47 +139,122 @@ NEW_BORDERS = """        needs_borders_map = all_windows.compute_needs_borders_m
                     for bb in which:
                         yield bb._replace(color=border_color_map.get(abs(bb.window_id), BorderColor.inactive))"""
 
-# marker -> (anchor, replacement)
+# ---- patch 3: fix inverted divider drag direction ---------------------------
+# In the splits layout a mouse-dragged divider always belongs to the *targeted
+# pair*, and `pair.bias` is the fraction given to that pair's leading (left/top)
+# child. So increasing the bias always moves the divider toward bottom/right --
+# i.e. toward the cursor. The drag is therefore always "forwards".
+#
+# Upstream computes a per-drag `fwd` sign via `size_increases_forwards()`. That
+# heuristic returns False (inverting the drag) when the divider under the cursor
+# belongs to an *ancestor* pair of the opposite orientation and the grabbed
+# window sits in that ancestor's leading subtree. In the IDE that is exactly the
+# top-band / editor divider: grab it from the `tabbar` (below) and it tracks the
+# mouse, but grab the same line from `vd` or `explorer` (above) and it inverts --
+# the "sometimes the panes move the opposite way" bug. (The same flaw inverts the
+# left-column / claude divider when grabbed from the tabbar's right edge.)
+#
+# The WindowResizeDragData defaults are already True and the upstream special
+# case hardcodes True; only the generic path is wrong. Pin both signs to True so
+# a dragged divider always follows the cursor, regardless of which pane edge it
+# was grabbed from. Pair *selection* is unchanged -- only the direction sign.
+OLD_DRAG = """            if ans.horizontal_id is None and p.horizontal:
+                p, fwd = pair_or_parent(p)
+                ans = ans._replace(horizontal_id=id(p), width_increases_rightwards=fwd)
+            if ans.vertical_id is None and not p.horizontal:
+                p, fwd = pair_or_parent(p)
+                ans = ans._replace(vertical_id=id(p), height_increases_downwards=fwd)"""
+
+NEW_DRAG = """            if ans.horizontal_id is None and p.horizontal:
+                p, fwd = pair_or_parent(p)
+                # kitty-ide: a dragged divider always follows the cursor (bias is
+                # the leading child's fraction), so the sign is always forward.
+                ans = ans._replace(horizontal_id=id(p), width_increases_rightwards=True)
+            if ans.vertical_id is None and not p.horizontal:
+                p, fwd = pair_or_parent(p)
+                ans = ans._replace(vertical_id=id(p), height_increases_downwards=True)"""
+
+# ---- patch 4: live_resize opt-out of resize-notification pausing ------------
+# During an interactive split-border drag, kitty pauses resize notifications to
+# every child (boss.py drag_resize_*), so a pane gets no SIGWINCH / PTY resize
+# until the drag *ends*. For the VD feed that means its kitty-graphics frame is
+# drawn at the last transmitted pixel size over a now-differently-sized window --
+# it freezes then clips ("bugged out") for the whole drag. A pane that sets the
+# `live_resize` user var opts out of the pause, so it keeps receiving SIGWINCH on
+# every drag step and the feed re-fits its frame to track the drag smoothly. Only
+# opted-in panes are affected; text panes keep the smooth paused behaviour.
+OLD_PAUSE = """    def pause_resize_notifications_to_child(self, pause: bool = True) -> None:
+        if pause:
+            if self._pause_resize_notifications_to_child is None:
+                self._pause_resize_notifications_to_child = -1, -1, -1, -1"""
+
+NEW_PAUSE = """    def pause_resize_notifications_to_child(self, pause: bool = True) -> None:
+        if pause:
+            # kitty-ide: a pane with the `live_resize` user var opts OUT of the
+            # resize pause, so it keeps getting SIGWINCH live during a border drag
+            # (the VD feed uses this to re-fit its graphics to the pane each step).
+            if (self.user_vars or {}).get('live_resize'):
+                return
+            if self._pause_resize_notifications_to_child is None:
+                self._pause_resize_notifications_to_child = -1, -1, -1, -1"""
+
+# (target, marker, anchor, replacement). marker present + replacement present
+# => already applied. Patches are grouped by target file below.
 PATCHES = [
-    ("fixed_lines_for_child", ANCHOR_IMPORT, ANCHOR_IMPORT + HELPER),
-    ("fixed_lines_for_child", OLD_H1, NEW_H1),  # marker shared; both go in together
-    ("hlgroup_by_gid", OLD_BORDERS, NEW_BORDERS),
+    (TARGET, "fixed_lines_for_child", ANCHOR_IMPORT, ANCHOR_IMPORT + HELPER),
+    (TARGET, "fixed_lines_for_child", OLD_H1, NEW_H1),  # marker shared; both go in together
+    (TARGET, "hlgroup_by_gid", OLD_BORDERS, NEW_BORDERS),
+    (TARGET, "width_increases_rightwards=True", OLD_DRAG, NEW_DRAG),
+    (TARGET_WINDOW, "get('live_resize')", OLD_PAUSE, NEW_PAUSE),
 ]
+
+# files whose __pycache__ must be cleared after a write
+_PYCACHE = {
+    TARGET: "/usr/lib/kitty/kitty/layout/__pycache__",
+    TARGET_WINDOW: "/usr/lib/kitty/kitty/__pycache__",
+}
 
 
 def main() -> int:
-    try:
-        with open(TARGET, encoding="utf-8") as f:
-            src = f.read()
-    except OSError as e:
-        print(f"kitty-ide patch: cannot read {TARGET}: {e}", file=sys.stderr)
-        return 0
+    # group patches by target file so each file is read once / written once
+    targets: dict[str, list] = {}
+    for target, marker, anchor, replacement in PATCHES:
+        targets.setdefault(target, []).append((marker, anchor, replacement))
 
-    changed = False
-    for marker, anchor, replacement in PATCHES:
-        if marker in src and replacement in src:
-            continue  # this piece already applied
-        if anchor not in src:
-            print(f"kitty-ide patch: anchor for {marker} not found, kitty source "
-                  "changed; skipping (IDE falls back to the watcher pin).",
-                  file=sys.stderr)
+    rc = 0
+    for target, patches in targets.items():
+        try:
+            with open(target, encoding="utf-8") as f:
+                src = f.read()
+        except OSError as e:
+            print(f"kitty-ide patch: cannot read {target}: {e}", file=sys.stderr)
             continue
-        src = src.replace(anchor, replacement, 1)
-        changed = True
 
-    if not changed:
-        return 0
+        changed = False
+        for marker, anchor, replacement in patches:
+            if marker in src and replacement in src:
+                continue  # this piece already applied
+            if anchor not in src:
+                print(f"kitty-ide patch: anchor for {marker} not found in "
+                      f"{target}, kitty source changed; skipping.",
+                      file=sys.stderr)
+                continue
+            src = src.replace(anchor, replacement, 1)
+            changed = True
 
-    try:
-        with open(TARGET, "w", encoding="utf-8") as f:
-            f.write(src)
-    except OSError as e:
-        print(f"kitty-ide patch: cannot write {TARGET}: {e}", file=sys.stderr)
-        return 0
+        if not changed:
+            continue
 
-    shutil.rmtree("/usr/lib/kitty/kitty/layout/__pycache__", ignore_errors=True)
-    print("kitty-ide patch: applied to kitty splits layout")
-    return 0
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(src)
+        except OSError as e:
+            print(f"kitty-ide patch: cannot write {target}: {e}", file=sys.stderr)
+            continue
+
+        shutil.rmtree(_PYCACHE.get(target, ""), ignore_errors=True)
+        print(f"kitty-ide patch: applied to {target}")
+    return rc
 
 
 if __name__ == "__main__":

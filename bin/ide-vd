@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# ide-vd — drive the kitty-ide Virtual Desktop.
+#
+# A Virtual Desktop is some graphical environment that speaks VNC; an *env*
+# (vd/envs/<name>.env) picks a provider (docker | qemu | remote) and its config.
+# This CLI brings envs up/down and gives Claude eyes (shot) and hands
+# (click/type/key/scroll). The live human feed is the `vd` pane (ide-vd-view).
+#
+#   ide-vd ls | use <env> | up [env] | down | status
+#   ide-vd shot [path]
+#   ide-vd rec  <secs> [fps] [outdir]  record frames -> PNGs + montage.png
+#   ide-vd hear <secs> [outdir]        record audio -> transcript + spectrogram
+#   ide-vd click X Y [left|right|middle] | move X Y | scroll up|down [n]
+#   ide-vd type "text" | key <combo>
+#   ide-vd open <url> | run <cmd...> | launch [--gpu] <cmd...> | gl <cmd...>
+#   ide-vd reset | commit [tag]        destroy / snapshot the environment
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+reporoot="$(dirname "$here")"
+envsdir="$reporoot/vd/envs"
+state="$HOME/.cache/ide-vd"
+active_file="$state/active"
+venv="$HOME/.local/share/ide-vd/venv/bin/python"
+mkdir -p "$state"
+
+# Each kitty-ide window gets its OWN virtual desktop. Key it to the kitty
+# instance (its control-socket pid, e.g. /tmp/ide.sock-2790 -> "2790") so every
+# window's container + port are distinct. Falls back to "default" outside the IDE.
+instance="${KITTY_LISTEN_ON##*-}"
+case "$instance" in ''|*[!0-9A-Za-z_]*) instance="default";; esac
+export IDE_VD_INSTANCE="$instance"
+
+# Docker may not be group-active in this login yet; fall back to sudo.
+if docker info >/dev/null 2>&1; then export DOCKER="docker";
+else export DOCKER="sudo docker"; fi
+
+die() { echo "ide-vd: $*" >&2; exit 1; }
+
+active_env() { [ -f "$active_file" ] && cat "$active_file" || true; }
+env_path()   { echo "$envsdir/$1.env"; }
+provider_of() {
+  local f; f="$(env_path "$1")"
+  [ -f "$f" ] || die "no such env: $1  (try: ide-vd ls)"
+  grep -E '^provider=' "$f" | head -1 | cut -d= -f2-
+}
+provider_script() {
+  local p; p="$(provider_of "$1")"
+  local s="$here/ide-vd-provider-$p"
+  [ -x "$s" ] || die "unknown provider '$p' (no $s)"
+  echo "$s"
+}
+need_active() { local e; e="$(active_env)"; [ -n "$e" ] || die "no active env (ide-vd use <env>)"; echo "$e"; }
+
+# endpoint of the active env -> "host<TAB>port<TAB>password"; empty if down
+endpoint() {
+  local e="$1" s; s="$(provider_script "$e")"
+  [ "$("$s" status "$(env_path "$e")")" = up ] || return 1
+  "$s" endpoint "$(env_path "$e")"
+}
+
+vnc() {  # vnc <env> <cmd> [args...] — one-off VNC op via the python core
+  local e="$1"; shift
+  local ep; ep="$(endpoint "$e")" || die "env '$e' is not up (ide-vd up)"
+  local host port pass; IFS=$'\t' read -r host port pass <<<"$ep"
+  [ -x "$venv" ] || die "python venv missing (see install.sh)"
+  "$venv" "$here/_ide_vd_vnc.py" --host "$host" --port "$port" --password "${pass:-}" "$@"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+
+  ls)
+    act="$(active_env)"
+    printf '%-16s %-8s %-7s %s\n' ENV PROVIDER STATE ACTIVE
+    for f in "$envsdir"/*.env; do
+      [ -e "$f" ] || continue
+      n="$(basename "$f" .env)"
+      p="$(provider_of "$n")"
+      st="$("$(provider_script "$n")" status "$f" 2>/dev/null || echo '?')"
+      printf '%-16s %-8s %-7s %s\n' "$n" "$p" "$st" \
+        "$([ "$n" = "$act" ] && echo '←')"
+    done
+    ;;
+
+  use)
+    [ $# -ge 1 ] || die "usage: ide-vd use <env>"
+    [ -f "$(env_path "$1")" ] || die "no such env: $1"
+    echo "$1" > "$active_file"; echo "active env: $1"
+    ;;
+
+  up)
+    if [ $# -ge 1 ]; then echo "$1" > "$active_file"; fi
+    e="$(need_active)"; s="$(provider_script "$e")"
+    echo "bringing up '$e'…"
+    "$s" up "$(env_path "$e")"
+    if endpoint "$e" >/dev/null 2>&1; then
+      echo "up: $e  →  $(endpoint "$e" | tr '\t' ':' | sed 's/:$//')"
+      echo "(the feed pane connects automatically)"
+    else
+      die "started but no VNC endpoint reachable yet"
+    fi
+    ;;
+
+  down)
+    e="$(need_active)"; s="$(provider_script "$e")"
+    "$s" down "$(env_path "$e")"; echo "down: $e"
+    ;;
+
+  status)
+    e="$(active_env)"; [ -n "$e" ] || { echo "no active env"; exit 0; }
+    s="$(provider_script "$e")"
+    echo "env:      $e"
+    echo "provider: $(provider_of "$e")"
+    echo "state:    $("$s" status "$(env_path "$e")")"
+    if ep="$(endpoint "$e" 2>/dev/null)"; then
+      echo "endpoint: $(echo "$ep" | cut -f1,2 | tr '\t' ':')"
+    fi
+    echo "fps:      ${IDE_VD_FPS:-5}"
+    ;;
+
+  shot)
+    e="$(need_active)"
+    out="${1:-$state/frame.png}"
+    vnc "$e" shot "$out"
+    echo "$out"
+    ;;
+
+  rec)
+    [ $# -ge 1 ] || die "usage: ide-vd rec <secs> [fps] [outdir]"
+    e="$(need_active)"
+    secs="$1"; fps="${2:-10}"; outdir="${3:-$state/rec}"
+    ep="$(endpoint "$e")" || die "env '$e' is not up (ide-vd up)"
+    IFS=$'\t' read -r host port pass <<<"$ep"
+    [ -x "$venv" ] || die "python venv missing (see install.sh)"
+    "$venv" "$here/_ide_vd_rec.py" --host "$host" --port "$port" \
+      --password "${pass:-}" --secs "$secs" --fps "$fps" --outdir "$outdir"
+    ;;
+
+  hear)
+    # Record the desktop's audio (the null sink's monitor) for <secs>, then turn
+    # it into Claude-readable artifacts: a transcript (speech) + a spectrogram
+    # montage (any sound). Coordinate with whatever should be playing.
+    [ $# -ge 1 ] || die "usage: ide-vd hear <secs> [outdir]"
+    e="$(need_active)"; s="$(provider_script "$e")"
+    secs="$1"; outdir="${2:-$state/hear}"
+    mkdir -p "$state/share" "$outdir"
+    "$s" run "$(env_path "$e")" ffmpeg -y -loglevel error \
+      -f pulse -i vdsink.monitor -t "$secs" -ac 1 -ar 16000 /vdshare/hear.wav \
+      || die "audio capture failed (is the env up with audio?)"
+    wav="$state/share/hear.wav"
+    [ -s "$wav" ] || die "no audio captured"
+    [ -x "$venv" ] || die "python venv missing (see install.sh)"
+    "$venv" "$here/_ide_vd_hear.py" --wav "$wav" --outdir "$outdir"
+    ;;
+
+  move|click|scroll|type|key)
+    e="$(need_active)"
+    vnc "$e" "$cmd" "$@"
+    ;;
+
+  open)
+    [ $# -ge 1 ] || die "usage: ide-vd open <url>"
+    e="$(need_active)"; s="$(provider_script "$e")"
+    "$s" launch "$(env_path "$e")" chromium \
+      --no-sandbox --disable-gpu --no-first-run --start-maximized "$1"
+    ;;
+
+  run|launch|gl)
+    # run    = blocking command (apt, glxinfo, …); launch = detached GUI app.
+    # gl     = run a GPU app through VirtualGL.  --gpu adds VirtualGL to run/launch.
+    act=run; [ "$cmd" = launch ] && act=launch
+    pre=(); [ "$cmd" = gl ] && pre=(vglrun -d egl)
+    if [ "${1:-}" = "--gpu" ]; then pre=(vglrun -d egl); shift; fi
+    [ $# -ge 1 ] || die "usage: ide-vd $cmd [--gpu] <cmd...>"
+    e="$(need_active)"; s="$(provider_script "$e")"
+    "$s" "$act" "$(env_path "$e")" "${pre[@]}" "$@"
+    ;;
+
+  reset)
+    e="$(need_active)"; s="$(provider_script "$e")"
+    "$s" destroy "$(env_path "$e")"; echo "reset: $e (removed; next 'up' is a clean box)"
+    ;;
+
+  commit)
+    e="$(need_active)"; s="$(provider_script "$e")"
+    tag="$("$s" commit "$(env_path "$e")" "${1:-}")" && echo "committed: $tag"
+    ;;
+
+  _resolve)   # internal: feed the live view pane
+    e="$(active_env)"
+    if [ -z "$e" ]; then echo none; exit 0; fi
+    if ep="$(endpoint "$e" 2>/dev/null)"; then
+      host="$(echo "$ep" | cut -f1)"; port="$(echo "$ep" | cut -f2)"; pass="$(echo "$ep" | cut -f3)"
+      printf 'up\t%s\t%s\t%s\t%s\n' "$host" "$port" "$pass" "$e"
+    else
+      printf 'down\t%s\n' "$e"
+    fi
+    ;;
+
+  help|-h|--help)
+    sed -n '2,16p' "$here/ide-vd" | sed 's/^# \{0,1\}//'
+    ;;
+
+  *) die "unknown command: $cmd  (ide-vd help)";;
+esac

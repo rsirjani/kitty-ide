@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# Header strip for the Claude pane in the kitty IDE. Shows the title of the
+# current chat so you can tell at a glance what each workspace's Claude is
+# working on. Claude Code sets the terminal title to an AI-generated summary of
+# the conversation; the claude pane is launched WITHOUT a kitty --title override
+# so that OSC title flows into the window's `title` (otherwise title_overridden
+# pins it). This script reads that title via `kitty @ ls` and renders it in the
+# thin "chat-header" pane sitting on top of the claude shell, keeping itself
+# pinned to a single row (mirrors ide-tabbar's pin).
+import sys, os, json, subprocess, select, re
+
+BAR_BG   = "#45475a"   # surface1 — the header bar fill
+TITLE_FG = "#fab387"   # peach — the chat title (Claude's accent feel)
+IDLE_FG  = "#7f849c"   # overlay1 — muted, when no chat is running
+ICON     = "✳"         # steady status glyph (we strip Claude's animated one)
+
+# Claude prefixes the title with an animated spinner; strip it so the header
+# text is stable (braille block U+2800–U+28FF plus a few status glyphs).
+SPIN_RE = re.compile(r"^[⠀-⣿✳✶✷✻◐-◓·•✱\s]+")
+
+def fg(h): r,g,b=(int(h[i:i+2],16) for i in (1,3,5)); return f"\033[38;2;{r};{g};{b}m"
+def bg(h): r,g,b=(int(h[i:i+2],16) for i in (1,3,5)); return f"\033[48;2;{r};{g};{b}m"
+RST = "\033[0m"
+
+def kitty(*args):
+    try:
+        return subprocess.run(["kitty","@",*args], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return None
+
+def clean(title):
+    return SPIN_RE.sub("", title or "").strip()
+
+def snapshot():
+    """One `kitty @ ls` -> (chat title or None, claude-running?, header (rows, cols))."""
+    r = kitty("ls"); title=None; running=False; dims=(None, None)
+    if not r or not r.stdout: return title, running, dims
+    try: data = json.loads(r.stdout)
+    except Exception: return title, running, dims
+    for w in data:
+        for t in w.get("tabs", []):
+            for win in t.get("windows", []):
+                v = win.get("user_vars", {})
+                if v.get("pane") == "claude":
+                    title = clean(win.get("title"))
+                    fps = win.get("foreground_processes", [])
+                    running = any(os.path.basename((p.get("cmdline") or [""])[0]) == "claude"
+                                 for p in fps)
+                if v.get("pane") == "chat-header":
+                    dims = (win.get("lines"), win.get("columns"))
+    return title, running, dims
+
+def pin_one_row(rows):
+    """Keep the header exactly one row tall; give freed space to the claude pane."""
+    if rows and rows > 1:
+        kitty("resize-window", "--axis", "vertical",
+              "--increment", str(1 - rows), "--match", "var:pane=chat-header")
+
+def render(title, running, cols):
+    cols = cols or 80
+    if running and title and title.lower() != "claude":
+        body = f" {ICON} {title} "
+        col = TITLE_FG
+    else:
+        body = f" {ICON} no chat — run claude here "
+        col = IDLE_FG
+    if len(body) > cols:                       # truncate with an ellipsis
+        body = body[:max(0, cols - 1)] + "…"
+    body = body[:cols].ljust(cols)             # fill the whole row -> a solid bar
+    sys.stdout.write("\033[H\033[2J" + bg(BAR_BG) + fg(col) + body + RST)
+    sys.stdout.flush()
+
+def main():
+    import termios, tty
+    fd = sys.stdin.fileno()
+    termios.tcgetattr(fd); tty.setcbreak(fd)
+    sys.stdout.write("\033[?25l")             # hide cursor
+    sys.stdout.write("\033[?1000;1006h")      # SGR mouse reporting (click -> focus claude)
+    sys.stdout.flush()
+    last, last_dims = None, None
+    while True:
+        r, _, _ = select.select([sys.stdin], [], [], 1.0)
+        title, running, dims = snapshot()
+        if dims != last_dims:                 # the strip was resized
+            pin_one_row(dims[0]); last_dims = dims; last = None
+        cur = (title, running, dims[1])
+        if cur != last:
+            render(title, running, dims[1]); last = cur
+        if r:
+            try: data = os.read(fd, 4096).decode("utf-8", "replace")
+            except OSError: data = ""
+            for mt in re.finditer(r"\033\[<(\d+);\d+;\d+([Mm])", data):
+                if mt.group(2) == "M" and int(mt.group(1)) == 0:   # left press
+                    kitty("focus-window", "--match", "var:pane=claude$")
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: pass

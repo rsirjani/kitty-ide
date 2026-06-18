@@ -23,6 +23,35 @@ echo "==> yazi config -> ~/.config/yazi-ide"
 link "$REPO/yazi/yazi.toml" "$HOME/.config/yazi-ide/yazi.toml"
 link "$REPO/yazi/init.lua"  "$HOME/.config/yazi-ide/init.lua"
 
+echo "==> virtual desktop (ide-vd)"
+# python venv for the VNC feed + Claude's eyes/hands (kept out of system python)
+VENV="$HOME/.local/share/ide-vd/venv"
+[ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+"$VENV/bin/pip" -q install --upgrade pip
+"$VENV/bin/pip" -q install asyncvnc pillow numpy faster-whisper
+mkdir -p "$HOME/.cache/ide-vd/share"
+# GPU acceleration for the desktop (NVIDIA): the container toolkit lets the
+# desktop's apps render on the host GPU via VirtualGL. Optional — without it the
+# desktop falls back to software GL (set gpu=none in the env).
+if command -v nvidia-smi >/dev/null && ! command -v nvidia-ctk >/dev/null; then
+  echo "   enabling NVIDIA GPU for containers…"
+  sudo pacman -S --needed --noconfirm nvidia-container-toolkit \
+    && sudo nvidia-ctk runtime configure --runtime=docker \
+    && sudo systemctl restart docker.service \
+    || echo "   (GPU setup skipped — set gpu=none in vd/envs/linux-desktop.env)"
+fi
+# the default 'linux-desktop' env runs in Docker; the IDE still works without it
+# (the vd pane just shows an idle card until an env is up).
+if ! command -v docker >/dev/null; then
+  echo "   docker not found — to enable the linux-desktop env:"
+  echo "     sudo pacman -S --needed docker && sudo systemctl enable --now docker.service"
+  echo "     sudo usermod -aG docker \$USER   # re-login for the group to take effect"
+else
+  DOCKER=docker; docker info >/dev/null 2>&1 || DOCKER="sudo docker"
+  echo "   building the linux desktop image (ide-vd-linux)…"
+  $DOCKER build -t ide-vd-linux "$REPO/vd" || echo "   (image build failed — build it later: $DOCKER build -t ide-vd-linux $REPO/vd)"
+fi
+
 echo "==> kitty layout patch (needs sudo)"
 sudo cp "$REPO/pacman/zz-kitty-fixed-lines.hook" /etc/pacman.d/hooks/
 sudo python3 "$REPO/kitty/patches/apply-fixed-lines-patch.py" || true
@@ -44,4 +73,7 @@ Notes:
  - ide.session has machine-specific paths (~/projects); adjust for your setup.
  - The crisp browser needs a patched carbonyl on PATH — see carbonyl/README.md.
  - PDF tabs use `tdf`; editing uses `nvim`.
+ - Virtual Desktop: `ide-vd up` starts the Docker desktop; the vd pane shows it
+   live, and Claude drives it with `ide-vd shot/click/type/key`, sees motion with
+   `rec`, hears sound with `hear`, and runs GPU apps with `gl`. See vd/README.md.
 EOF

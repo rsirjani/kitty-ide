@@ -1,0 +1,18 @@
+# Sourced by the IDE helper scripts to resolve the *current* IDE instance.
+#
+# Every pane/child of an IDE kitty window inherits KITTY_LISTEN_ON, pointing at
+# THAT instance's control socket (unix:/tmp/ide.sock-<pid>). Routing commands
+# through it -- instead of "the first ide.sock-* found in /tmp" -- makes each
+# action land on the IDE that issued it, never a sibling on another workspace.
+# State files are namespaced by the same instance id, so instances never share
+# active-doc / explorer-cwd state. Falls back to socket discovery only when run
+# outside an IDE (manual debugging with a single instance running).
+if [ -n "${KITTY_LISTEN_ON:-}" ]; then
+  sock="$KITTY_LISTEN_ON"
+else
+  sock="unix:$(find /tmp -maxdepth 1 -name 'ide.sock-*' 2>/dev/null | head -1)"
+fi
+IDE_ID="${sock##*ide.sock-}"; [ "$IDE_ID" = "$sock" ] && IDE_ID="default"
+IDE_ACTIVE_DOC="/tmp/ide-${IDE_ID}-active-doc"
+IDE_CWD_FILE="${IDE_CWD_FILE:-/tmp/ide-${IDE_ID}-explorer-cwd}"
+IDE_TABS_DIRTY="/tmp/ide-${IDE_ID}-tabs-dirty"

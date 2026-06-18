@@ -24,23 +24,23 @@ some IDE ergonomics. This project adds exactly those, and nothing more:
 - [x] Fast PDF viewing (tdf)
 - [x] Fixed-height tab bar via kitty `fixed_lines` layout patch
 - [x] Merged highlight — tab bar + editor read as one pane (`hlgroup` patch)
-- [x] Explorer-following terminal with an idle guard (silent `cd`, never into a session)
+- [x] Explorer-following terminal with an idle guard — silent `cd`, never into a running session *and* never onto a half-typed command (OSC 133 prompt-mark check)
 - [x] Hover-to-focus + keyboard pane/tab switching
+- [x] Double-click in the explorer to activate an item (file → tab, dir → enter)
+- [x] Right-click an explorer item to copy its path to the clipboard
+- [x] Double-click a path segment in the explorer header to jump to that level
 - [x] Idle ASCII animation (sleeping cat)
 - [x] Patch persistence: kitty pinned + pacman re-apply hook
+- [x] **Virtual desktop Claude can pilot** — a VNC-backed graphical environment
+  (Docker X11 desktop now; QEMU VM / remote as drop-in providers) rendered live
+  in the feed pane, with eyes (`ide-vd shot`) and hands (`ide-vd click/type/key`)
+- [x] **VD senses + power** — video (`rec` → frames + montage), **ears**
+  (`hear` → faster-whisper transcript + spectrogram, since Claude takes no
+  audio/video), **GPU** (NVIDIA RTX via container toolkit + VirtualGL, `ide-vd gl`),
+  and **persistence** (`down`=stop, `reset`, `commit`) for a self-configuring box
 
 ## Next / ideas
 
-- **Kill the hover resize-cursor** on the locked tab-bar border. The drag is
-  already a no-op, but the cursor still *looks* draggable — that's kitty's
-  compiled-C border detection, so it needs a small kitty source patch + a local
-  kitty build (updates are already pinned, so a local build is viable now).
-- **Tighter idle guard** for the explorer-follow: don't `cd` if there's
-  unsubmitted text at the prompt (currently it only checks for a running
-  process, so a half-typed command could get an appended `cd`).
-- **Upstream the kitty patches** — `fixed_lines` and `hlgroup` are general
-  enough to propose to kitty as real features (fixed-size windows, highlight
-  groups), which would remove the need for the local patch entirely.
 - **More openers** — image viewer tab (kitty icat / chafa), a git status/diff
   pane, a scratch/REPL tab, markdown preview.
 - **carbonyl polish** — damage-based partial frame updates (scrolling currently
@@ -49,6 +49,10 @@ some IDE ergonomics. This project adds exactly those, and nothing more:
   animations.
 - **Portability** — parametrize the hardcoded paths in `ide.session` so the repo
   installs cleanly on another machine / for someone else.
+- **Virtual-desktop polish** — damage-based partial frame updates for a higher
+  feed/`rec` FPS (today it reblits whole frames); a provisioned QEMU VM env for
+  testing other OSes (Windows/macOS); GPU-accelerated Chromium under headless X;
+  combined audio+video capture in one `rec`; surfacing the desktop's clipboard.
 
 ## Notes for future sessions
 

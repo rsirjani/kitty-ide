@@ -3,8 +3,20 @@
 #   explorer | [ tab-bar / content ] | claude
 # Documents open as overlays over the content pane; the tab-bar switches them.
 export PATH="$HOME/.local/bin:$PATH"
-mkdir -p "$HOME/.cache/ide-shots"
-rm -f /tmp/ide.sock-* /tmp/ide-tabs-dirty 2>/dev/null
+mkdir -p "$HOME/.cache/ide-shots" "$HOME/.cache/ide-vd"
+
+# Reap only *stale* control sockets (owning kitty gone) -- never a live
+# sibling's. Each IDE gets its own /tmp/ide.sock-<kitty-pid>; helper scripts
+# route through KITTY_LISTEN_ON, so instances stay self-contained. (The old
+# blanket `rm` here deleted running siblings' sockets, hanging their `kitty @`.)
+for s in /tmp/ide.sock-*; do
+  [ -S "$s" ] || continue
+  pid="${s##*-}"
+  case "$pid" in (*[!0-9]*) continue ;; esac      # suffix isn't a pid -> leave it
+  kill -0 "$pid" 2>/dev/null || rm -f "$s" "/tmp/ide-${pid}-active-doc" \
+    "/tmp/ide-${pid}-explorer-cwd" "/tmp/ide-${pid}-tabs-dirty"
+done
+
 exec kitty --class ide --config "$HOME/.config/kitty/ide.conf" \
   -o allow_remote_control=yes -o listen_on=unix:/tmp/ide.sock \
   -o confirm_os_window_close=0 --title "IDE" \

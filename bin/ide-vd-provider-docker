@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Virtual Desktop provider: a headless X11 Linux desktop in a Docker container.
+# Contract:  up|down|destroy|commit|status|endpoint|run|launch <envfile> [args...]
+#
+# Reads from the env file:  image, geometry (WxH), vncport, mount (->/work),
+#   gpu (nvidia|none)
+# The container's x11vnc always serves :5901 inside; we map it to `vncport` on
+# 127.0.0.1 only, so the desktop is never reachable off-host.
+#
+# Persistence: `down` STOPS the container (installs/state survive up/down);
+# `destroy` removes it (clean slate); `commit` snapshots it to an image.
+set -euo pipefail
+
+action="${1:?up|down|destroy|commit|status|endpoint|run|launch}"; envfile="${2:?envfile}"; shift 2 || true
+# shellcheck disable=SC1090
+provider=docker image=ide-vd-linux geometry=1280x800 vncport=5901 mount="$HOME/projects" gpu=none
+source "$envfile"
+
+DOCKER="${DOCKER:-docker}"
+# IDE_VD_INSTANCE (set by the ide-vd CLI from the kitty socket) makes the
+# container + bind-mount per-window, so each kitty-ide has its own desktop.
+inst="${IDE_VD_INSTANCE:-}"
+name="ide-vd-$(basename "$envfile" .env)${inst:+-$inst}"
+share="$HOME/.cache/ide-vd/share${inst:+-$inst}"
+
+is_running() { [ "$($DOCKER inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)" = true ]; }
+exists()     { $DOCKER inspect "$name" >/dev/null 2>&1; }
+# Host port is assigned dynamically by docker (-p 127.0.0.1::5901) so instances
+# never collide; this reads back the actual mapped port.
+mapped_port() { $DOCKER port "$name" 5901/tcp 2>/dev/null | head -1 | sed 's/.*://'; }
+
+case "$action" in
+  up)
+    if is_running; then exit 0; fi
+    if exists; then $DOCKER start "$name" >/dev/null; else
+      mkdir -p "$mount" "$share"
+      gpu_args=()
+      # The container toolkit defaults to compute-only; OpenGL/EGL needs the
+      # `graphics`/`display` driver capabilities — hence DRIVER_CAPABILITIES=all.
+      [ "$gpu" = nvidia ] && gpu_args=(--gpus all \
+        -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all)
+      $DOCKER run -d --name "$name" \
+        -p "127.0.0.1::5901" \
+        -e "GEOMETRY=${geometry}x24" \
+        --shm-size=512m \
+        -v "$mount":/work \
+        -v "$share":/vdshare \
+        "${gpu_args[@]}" \
+        "$image" >/dev/null
+    fi
+    for _ in $(seq 1 100); do
+      p="$(mapped_port)"
+      if [ -n "$p" ] && (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null; then exec 3>&- 3<&-; exit 0; fi
+      sleep 0.2
+    done
+    echo "docker: VNC port never came up" >&2; exit 1
+    ;;
+
+  down)                          # stop but keep the container (state persists)
+    is_running && $DOCKER stop "$name" >/dev/null 2>&1 || true
+    ;;
+
+  destroy)                       # remove the container entirely (clean slate)
+    exists && $DOCKER rm -f "$name" >/dev/null 2>&1 || true
+    ;;
+
+  commit)                        # snapshot the live container to an image
+    tag="${1:-${image}-snapshot}"
+    exists || { echo "docker: '$name' does not exist" >&2; exit 1; }
+    $DOCKER commit "$name" "$tag" >/dev/null && echo "$tag"
+    ;;
+
+  status)
+    if is_running; then echo up; else echo down; fi
+    ;;
+
+  endpoint)
+    is_running && { p="$(mapped_port)"; [ -n "$p" ] && printf '127.0.0.1\t%s\t\n' "$p"; }
+    ;;
+
+  run)      # blocking command — streams stdout (apt, glxinfo, ffmpeg, …)
+    is_running || { echo "docker: '$name' is not running" >&2; exit 1; }
+    $DOCKER exec "$name" "$@"
+    ;;
+
+  launch)   # detached GUI app — returns immediately, app keeps running
+    is_running || { echo "docker: '$name' is not running" >&2; exit 1; }
+    $DOCKER exec -d "$name" "$@"
+    ;;
+
+  *) echo "docker provider: unknown action '$action'" >&2; exit 2;;
+esac

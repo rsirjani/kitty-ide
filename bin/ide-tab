@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Switch/close document tabs by keybind:  ide-tab next | prev | close | <N>
 export PATH="$HOME/.local/bin:$PATH"
-sock="unix:$(find /tmp -maxdepth 1 -name 'ide.sock-*' 2>/dev/null | head -1)"
+. ide-sock   # -> sock, IDE_ACTIVE_DOC for THIS instance
 action="${1:-next}"
 
 if [ "$action" = "close" ]; then
@@ -24,9 +24,9 @@ if foc in ids:
     kitty @ --to "$sock" close-window --match "id:$closed" >/dev/null 2>&1
     if [ -n "$nextid" ]; then
       kitty @ --to "$sock" focus-window --match "id:$nextid" >/dev/null 2>&1
-      echo "$nextid" > /tmp/ide-active-doc
+      echo "$nextid" > "$IDE_ACTIVE_DOC"
     else
-      rm -f /tmp/ide-active-doc
+      rm -f "$IDE_ACTIVE_DOC"
     fi
   fi
   exit 0
@@ -48,4 +48,4 @@ elif a=='prev': i=(ids.index(foc)-1)%len(ids) if foc in ids else 0
 else: i=int(a)-1 if a.isdigit() and 0<int(a)<=len(ids) else 0
 print(ids[i])
 ")
-[ -n "$target" ] && { kitty @ --to "$sock" focus-window --match "id:$target" >/dev/null 2>&1; echo "$target" > /tmp/ide-active-doc; }
+[ -n "$target" ] && { kitty @ --to "$sock" focus-window --match "id:$target" >/dev/null 2>&1; echo "$target" > "$IDE_ACTIVE_DOC"; }

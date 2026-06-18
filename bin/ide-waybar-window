@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+# Waybar custom module: the active window's title, but for a kitty IDE window
+# (class=ide, launched with a static --title "IDE") show the current Claude chat
+# title instead. Each IDE's control socket is /tmp/ide.sock-<pid> where <pid> is
+# the kitty process pid == the Hyprland window pid, so the focused window maps
+# straight to its instance. The claude pane is launched without a kitty --title
+# override, so Claude Code's OSC title (an AI summary of the chat) lands in that
+# window's `title`.
+#
+# Runs continuously, printing the label only when it changes (the waybar
+# "continuous" pattern). Polls so it catches both Hyprland focus changes and
+# Claude updating its title in place (which is not a Hyprland event, since the
+# kitty OS-window title stays "IDE").
+import sys, os, json, subprocess, time, re
+
+SPIN_RE = re.compile(r"^[⠀-⣿✳✶✷✻◐-◓·•✱\s]+")   # strip Claude's animated prefix
+
+def run(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return ""
+
+def pango_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def chat_title(pid):
+    """The Claude chat title for the IDE whose kitty pid is `pid`, or None."""
+    sock = f"/tmp/ide.sock-{pid}"
+    if not os.path.exists(sock):
+        return None
+    ls = run("kitty", "@", "--to", f"unix:{sock}", "ls")
+    try:
+        data = json.loads(ls)
+    except Exception:
+        return None
+    for w in data:
+        for t in w.get("tabs", []):
+            for win in t.get("windows", []):
+                if win.get("user_vars", {}).get("pane") != "claude":
+                    continue
+                fps = win.get("foreground_processes", [])
+                running = any(os.path.basename((p.get("cmdline") or [""])[0]) == "claude"
+                             for p in fps)
+                if not running:
+                    return None
+                title = SPIN_RE.sub("", win.get("title") or "").strip()
+                return title if title and title.lower() != "claude" else None
+    return None
+
+def label():
+    try:
+        d = json.loads(run("hyprctl", "activewindow", "-j") or "{}")
+    except Exception:
+        d = {}
+    title = d.get("title", "") or ""
+    if d.get("class") == "ide" and d.get("pid"):
+        title = chat_title(d["pid"]) or title    # fall back to "IDE" if no chat
+    return pango_escape(title)
+
+def main():
+    last = None
+    while True:
+        cur = label()
+        if cur != last:
+            sys.stdout.write(cur + "\n"); sys.stdout.flush()
+            last = cur
+        time.sleep(0.4)
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: pass

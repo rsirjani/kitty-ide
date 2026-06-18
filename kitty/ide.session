@@ -1,25 +1,42 @@
-# Single-window IDE.  Left column = explorer (top) over the editor zone
-# (tab-bar + content); claude on the right.
-#   ┌─explorer──────┬─────────┐
-#   ├───────────────┤ claude  │
-#   │ tab-bar       │         │
-#   │ content (tab) │         │
-#   └───────────────┴─────────┘
+# Single-window IDE.  Left column top band = explorer (narrow) + virtual-desktop
+# feed; editor zone (tab-bar + content) below; claude on the right.
+#   ┌─explorer─┬─ vd desktop feed ──┬─────────┐
+#   ├──────────┴────────────────────┤ claude  │
+#   │ tab-bar                       │         │
+#   │ content (tab)                 │         │
+#   └────────────────────────────────┴─────────┘
 # Documents open as OVERLAYS over "content"; the tab-bar lists/switches them.
+# The vd pane runs ide-vd-view, a live VNC feed of the active virtual desktop.
 layout splits
 
-# explorer (will become the top of the left column)
+# explorer (top-left of the left column)
 launch --var pane=explorer --title explorer --cwd=/home/tin/projects bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; setsid ide-cwd-follow >/dev/null 2>&1 & YAZI_CONFIG_HOME=$HOME/.config/yazi-ide exec yazi /home/tin/projects"
 
-# claude on the right (~28% width)
-launch --location=vsplit --bias=28 --var pane=claude --title claude --cwd=/home/tin/projects sh -c 'export NO_ZELLIJ_AUTOSTART=1; exec zsh'
+# claude column on the right (~28% width): a thin header strip (shows the current
+# Claude chat title) on top, the claude shell below it -- like the editor's
+# tab-bar/content pair. Both share hlgroup=claude so focusing the shell lights up
+# the header too (one box).
+# pane var is "chat-header" (not "claude-header"): kitty --match var: is an
+# unanchored regex, so naming it "claude…" would make every `var:pane=claude`
+# match (ide-cwd-follow, ide-pane) also hit this strip. Keep names non-overlapping.
+launch --location=vsplit --bias=28 --var pane=chat-header --var fixed_lines=1 --var hlgroup=claude --title chat-header --watcher ide-pin-tabbar.py bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-claude-header"
 
-# editor zone BELOW the explorer: tab-bar strip (takes ~75% of the left column height)
+# the claude shell BELOW the header. No --title: Claude Code sets the terminal
+# title to an AI summary of the chat via OSC, and a kitty --title would pin it
+# (title_overridden), so we leave it free for the header/Waybar to read.
+focus_matching_window var:pane=chat-header
+launch --location=hsplit --bias=97 --var pane=claude --var hlgroup=claude --cwd=/home/tin/projects sh -c 'export NO_ZELLIJ_AUTOSTART=1; exec zsh'
+
+# editor zone BELOW the top band: tab-bar strip (top band keeps ~35% height)
 focus_matching_window var:pane=explorer
-launch --location=hsplit --bias=75 --var pane=tabbar --var fixed_lines=1 --var hlgroup=editor --title tabbar --watcher ide-pin-tabbar.py bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-tabbar"
+launch --location=hsplit --bias=65 --var pane=tabbar --var fixed_lines=1 --var hlgroup=editor --title tabbar --watcher ide-pin-tabbar.py bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-tabbar"
 
 # content fills the rest below the tab-bar (tab-bar stays a thin strip on top)
 focus_matching_window var:pane=tabbar
 launch --location=hsplit --bias=94 --var pane=content --var hlgroup=editor --title content bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-home"
+
+# virtual-desktop feed RIGHT of the explorer, sharing the top band (~70% width)
+focus_matching_window var:pane=explorer
+launch --location=vsplit --bias=70 --var pane=vd --var live_resize=1 --title "desktop" bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; exec ide-vd-view"
 
 focus_matching_window var:pane=claude

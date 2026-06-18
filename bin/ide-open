@@ -4,7 +4,7 @@
 #   ide-open pdf   <file>   -> tdf (fast PDF reader)
 #   ide-open browser [url]  -> carbonyl (in-terminal browser)
 export PATH="$HOME/.local/bin:$PATH"
-sock="unix:$(find /tmp -maxdepth 1 -name 'ide.sock-*' 2>/dev/null | head -1)"
+. ide-sock   # -> sock, IDE_ACTIVE_DOC, IDE_TABS_DIRTY for THIS instance
 mode="${1:-edit}"; arg="${2:-}"
 
 # focus the content pane so the overlay covers exactly that region
@@ -18,15 +18,27 @@ case "$mode" in
   pdf)
     [ -n "$arg" ] || exit 0
     if command -v tdf >/dev/null; then prog=tdf; else prog=kpdf; fi
+    # live_resize: tdf renders pages via the kitty graphics protocol, so it must
+    # keep getting SIGWINCH during a border drag to re-fit (see kitty patch 3).
     id=$(kitty @ --to "$sock" launch --type=overlay --cwd="$(dirname "$arg")" \
-      --var doc=1 --var title="$(basename "$arg")" "$prog" "$arg" 2>/dev/null) ;;
+      --var doc=1 --var live_resize=1 --var title="$(basename "$arg")" "$prog" "$arg" 2>/dev/null)
+    # tdf opens fit-to-screen -- pages render tiny/unreadable; its `z` key toggles
+    # fill-screen ("zoom") mode. Auto-press it once so PDFs open readable. It's a
+    # *toggle*, so send exactly one `z`, and only after a beat: tdf reads stdin
+    # during startup to detect kitty graphics, and an earlier keystroke would be
+    # swallowed by that handshake.
+    if [ "$prog" = tdf ] && [ -n "$id" ]; then
+      ( sleep 0.5; kitty @ --to "$sock" send-text --match "id:$id" z ) >/dev/null 2>&1 &
+    fi
+    ;;
   browser)
     url="${arg:-https://arxiv.org}"
     # --graphics: render the page crisply via kitty's graphics protocol
-    # (patched libcarbonyl) instead of blocky half-blocks.
+    # (patched libcarbonyl) instead of blocky half-blocks. live_resize keeps the
+    # SIGWINCH flowing during a border drag so the page re-blits to track it.
     id=$(kitty @ --to "$sock" launch --type=overlay \
-      --var doc=1 --var title="🌐 web" carbonyl --graphics "$url" 2>/dev/null) ;;
+      --var doc=1 --var live_resize=1 --var title="🌐 web" carbonyl --graphics "$url" 2>/dev/null) ;;
 esac
 
-[ -n "$id" ] && echo "$id" > /tmp/ide-active-doc   # remember the active document for ide-pane
-touch /tmp/ide-tabs-dirty
+[ -n "$id" ] && echo "$id" > "$IDE_ACTIVE_DOC"   # remember the active document for ide-pane
+touch "$IDE_TABS_DIRTY"

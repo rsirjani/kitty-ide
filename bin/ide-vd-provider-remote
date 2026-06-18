@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Virtual Desktop provider: a remote (or already-running) VNC endpoint.
+# The simplest possible provider — it owns no lifecycle, it just points the
+# feed/eyes/hands at an endpoint someone else manages.
+#
+# Contract:  up|down|status|endpoint|run <envfile>
+# Reads from the env file:  host, port, password
+set -euo pipefail
+
+action="${1:?}"; envfile="${2:?}"; shift 2 || true
+# shellcheck disable=SC1090
+provider=remote host=127.0.0.1 port=5900 password=
+source "$envfile"
+
+reachable() { (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; return 1; }
+
+case "$action" in
+  up)       reachable || { echo "remote: ${host}:${port} not reachable" >&2; exit 1; } ;;
+  down)     : ;;   # not ours to stop
+  status)   if reachable; then echo up; else echo down; fi ;;
+  endpoint) reachable && printf '%s\t%s\t%s\n' "$host" "$port" "$password" ;;
+  run)      echo "remote: 'run' unsupported — launch apps inside the remote host" >&2; exit 1 ;;
+  *)        echo "remote provider: unknown action '$action'" >&2; exit 2 ;;
+esac

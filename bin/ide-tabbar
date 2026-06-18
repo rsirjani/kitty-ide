@@ -12,6 +12,15 @@ CLOSE_FG             = "#f38ba8"              # red "×" close glyph
 
 NEW_BROWSER = "__newbrowser__"
 
+# Per-instance active-doc file, keyed off THIS IDE's control socket
+# (KITTY_LISTEN_ON = unix:/tmp/ide.sock-<pid>), so sibling IDEs never share it.
+def _active_doc_path():
+    s = os.environ.get("KITTY_LISTEN_ON", "")
+    iid = s.rsplit("ide.sock-", 1)[-1] if "ide.sock-" in s else "default"
+    return f"/tmp/ide-{iid}-active-doc"
+
+ACTIVE_DOC = _active_doc_path()
+
 def fg(h): r,g,b=(int(h[i:i+2],16) for i in (1,3,5)); return f"\033[38;2;{r};{g};{b}m"
 def bg(h): r,g,b=(int(h[i:i+2],16) for i in (1,3,5)); return f"\033[48;2;{r};{g};{b}m"
 RST = "\033[0m"
@@ -81,14 +90,14 @@ def render(ds):
 
 def focus(wid):
     kitty("focus-window", "--match", f"id:{wid}")
-    try: open("/tmp/ide-active-doc", "w").write(str(wid))   # for ide-pane "editor"
+    try: open(ACTIVE_DOC, "w").write(str(wid))   # for ide-pane "editor"
     except Exception: pass
 
 def close(wid):
     kitty("close-window", "--match", f"id:{wid}")
     try:
-        if open("/tmp/ide-active-doc").read().strip() == str(wid):
-            os.remove("/tmp/ide-active-doc")
+        if open(ACTIVE_DOC).read().strip() == str(wid):
+            os.remove(ACTIVE_DOC)
     except Exception: pass
 
 def main():
