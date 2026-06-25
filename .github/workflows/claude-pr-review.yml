@@ -19,7 +19,9 @@ on:
 
 # Don't stack reviews: a new push cancels an in-flight review of the old commit.
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  # Include the event name so a (skipped) issue_comment run can't cancel an
+  # in-progress pull_request review for the same PR.
+  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
