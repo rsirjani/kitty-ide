@@ -23,6 +23,28 @@ echo "==> yazi config -> ~/.config/yazi-ide"
 link "$REPO/yazi/yazi.toml" "$HOME/.config/yazi-ide/yazi.toml"
 link "$REPO/yazi/init.lua"  "$HOME/.config/yazi-ide/init.lua"
 
+echo "==> editor-pane viewer dependencies"
+# ide-open renders many file types in the editor pane:
+#   glow (markdown)  mpv (video/audio)  visidata (csv/xlsx tables, editable)
+#   libreoffice (docx/pptx/xlsx -> crisp PDF render via tdf, + GUI editing in
+#                the Virtual Desktop)
+# kitten icat (images) ships with kitty; tdf/carbonyl install separately (see
+# their READMEs). Install whichever Arch packages are missing.
+pkgs=()
+command -v glow     >/dev/null || pkgs+=(glow)
+command -v mpv      >/dev/null || pkgs+=(mpv)
+[ -x /usr/bin/less ]           || pkgs+=(less)   # ide-view-md pages glow through less
+command -v ffmpeg   >/dev/null || pkgs+=(ffmpeg)
+command -v visidata >/dev/null || command -v vd >/dev/null || pkgs+=(visidata)
+command -v soffice  >/dev/null || command -v libreoffice >/dev/null || pkgs+=(libreoffice-fresh)
+if [ ${#pkgs[@]} -gt 0 ]; then
+  echo "   installing: ${pkgs[*]}  (libreoffice is ~500MB)"
+  sudo pacman -S --needed --noconfirm "${pkgs[@]}" \
+    || echo "   (pacman failed — install manually: ${pkgs[*]})"
+else
+  echo "   all present (glow, mpv, visidata, libreoffice)"
+fi
+
 echo "==> virtual desktop (ide-vd)"
 # python venv for the VNC feed + Claude's eyes/hands (kept out of system python)
 VENV="$HOME/.local/share/ide-vd/venv"
@@ -72,6 +94,9 @@ Done. Launch the IDE with:  ide
 Notes:
  - ide.session has machine-specific paths (~/projects); adjust for your setup.
  - The crisp browser needs a patched carbonyl on PATH — see carbonyl/README.md.
+ - The editor pane renders by type: markdown→glow, html→web tab, images→icat,
+   video/audio→mpv, csv/xlsx→visidata, docx/pptx→LibreOffice PDF, pdf→tdf, else
+   nvim. Press Alt+M (or click the tab-bar ⇄) to morph rendered⇄editable.
  - PDF tabs use `tdf`; editing uses `nvim`.
  - Virtual Desktop: `ide-vd up` starts the Docker desktop; the vd pane shows it
    live, and Claude drives it with `ide-vd shot/click/type/key`, sees motion with

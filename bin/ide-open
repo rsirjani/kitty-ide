@@ -1,44 +1,226 @@
 #!/usr/bin/env bash
 # Open content as a TAB (kitty overlay) in the IDE editor pane.
-#   ide-open edit  <file>   -> nvim
-#   ide-open pdf   <file>   -> tdf (fast PDF reader)
-#   ide-open browser [url]  -> carbonyl (in-terminal browser)
+#
+#   ide-open open    <file>   -> detect the file's type and pick the best viewer
+#   ide-open view    <file>   -> rendered view (md/html/image/video/office/csv/…)
+#   ide-open edit    <file>   -> nvim
+#   ide-open pdf     <file>   -> tdf (fast PDF reader)
+#   ide-open browser [url]    -> carbonyl (in-terminal browser)
+#   ide-open toggle           -> morph the focused tab between rendered <-> editable
+#
+# Every document overlay carries two user vars so a tab is self-describing and
+# can be "morphed" in place:  file=<abspath>  vmode=<view|edit>.  The tab-bar
+# (ide-tabbar) reads them to draw the ⇄ button; `toggle` reads them to flip mode.
 export PATH="$HOME/.local/bin:$PATH"
-. ide-sock   # -> sock, IDE_ACTIVE_DOC, IDE_TABS_DIRTY for THIS instance
+. ide-sock   # -> sock, IDE_ID, IDE_ACTIVE_DOC, IDE_TABS_DIRTY for THIS instance
+
 mode="${1:-edit}"; arg="${2:-}"
 
-# focus the content pane so the overlay covers exactly that region
-kitty @ --to "$sock" focus-window --match var:pane=content >/dev/null 2>&1
+# Open documents as an overlay anchored to the content pane via --next-to.
+# Anchoring explicitly (rather than focusing content first and overlaying the
+# "active" window) is essential: ide-open is invoked from whichever pane fired
+# it -- the tab-bar on `+ web`, the claude pane on a clicked link -- and with
+# focus_follows_mouse the pointer can snap focus back there before the overlay
+# lands, which would otherwise open the doc over the 1-row tab-bar or claude.
+NEXT_TO="--next-to var:pane=content"
+
+abspath() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+notify()  { echo "ide-open: $*" >&2; }
+
+# ---- file type -> category -------------------------------------------------
+# Extension first (cheap + reliable), then libmagic mime as a fallback.
+category_of() {
+  local f="$1" ext mime
+  ext="${f##*.}"; ext="${ext,,}"
+  case "$ext" in
+    md|markdown|mdown|mkd|mkdn)            echo markdown; return;;
+    html|htm|xhtml)                        echo html;     return;;
+    png|jpg|jpeg|gif|webp|bmp|tiff|tif|ico|svg|avif) echo image; return;;
+    mp4|mkv|webm|mov|avi|m4v|wmv|flv)      echo video;    return;;
+    mp3|flac|wav|ogg|opus|m4a|aac)         echo audio;    return;;
+    pdf)                                   echo pdf;      return;;
+    csv|tsv)                               echo csv;      return;;
+    xlsx|xls|ods|xlsm)                     echo sheet;    return;;
+    docx|doc|odt|rtf)                      echo document; return;;
+    pptx|ppt|odp)                          echo slides;   return;;
+  esac
+  mime="$(file -bL --mime-type -- "$f" 2>/dev/null)"
+  case "$mime" in
+    text/html)        echo html;     return;;
+    text/markdown)    echo markdown; return;;
+    image/*)          echo image;    return;;
+    video/*)          echo video;    return;;
+    audio/*)          echo audio;    return;;
+    application/pdf)  echo pdf;       return;;
+    text/csv)         echo csv;       return;;
+    *)                echo text;      return;;
+  esac
+}
+
+# The default mode a category opens in. Media/docs render; text/code edits.
+default_mode_of() {
+  case "$1" in
+    markdown|html|image|video|audio|pdf|csv|sheet|document|slides) echo view;;
+    *)                                                             echo edit;;
+  esac
+}
+
+# ---- overlay launcher ------------------------------------------------------
+# launch_overlay <vmode> <filevar> <live_resize:0|1> <title> <cmd> [args...]
+# Sets the global `id` to the new window id (read by the active-doc bookkeeping).
+launch_overlay() {
+  local vmode="$1" filevar="$2" lr="$3" title="$4"; shift 4
+  local extra=(); [ "$lr" = 1 ] && extra+=(--var live_resize=1)
+  id=$(kitty @ --to "$sock" launch --type=overlay $NEXT_TO \
+       --cwd="$(dirname "$filevar")" \
+       --var doc=1 --var vmode="$vmode" --var "file=$filevar" --var title="$title" \
+       "${extra[@]}" "$@" 2>/dev/null)
+}
+
+# Lowest-numbered persistent carbonyl profile not currently in use (so logins/
+# cookies survive and two tabs don't collide on Chromium's singleton lock).
+carbonyl_profile() {
+  local base="$HOME/.local/share/ide-carbonyl"; mkdir -p "$base"
+  local inuse n=0
+  inuse="$(ps -eo args 2>/dev/null | grep -oE -- "--user-data-dir=$base/p[0-9]+" | sed 's/.*=//')"
+  while printf '%s\n' "$inuse" | grep -qxF "$base/p$n"; do n=$((n + 1)); done
+  printf '%s' "$base/p$n"
+}
+
+# Render a PDF as a tdf overlay. <filevar> lets office docs keep the ORIGINAL
+# path on the tab (so morph->edit reopens the source, not the cached PDF).
+view_pdf() {
+  local pdf="$1" title="$2" filevar="${3:-$1}" prog
+  if command -v tdf >/dev/null; then prog=tdf; else prog=kpdf; fi
+  launch_overlay view "$filevar" 1 "$title" "$prog" "$pdf"
+  # tdf opens fit-to-screen (tiny); its `z` key toggles fill-screen. Press it
+  # once, after a beat -- tdf swallows stdin during the kitty-graphics handshake.
+  if [ "$prog" = tdf ] && [ -n "$id" ]; then
+    ( sleep 0.5; kitty @ --to "$sock" send-text --match "id:$id" z ) >/dev/null 2>&1 &
+  fi
+}
+
+# Convert an office doc to PDF once, cached by name+mtime under tmpfs-ish /tmp.
+# Isolated UserInstallation so a headless convert never fights a GUI soffice.
+office_to_pdf() {
+  local file="$1" cache name mt out
+  cache="/tmp/ide-${IDE_ID}-render"; mkdir -p "$cache"
+  name="$(basename "$file")"; name="${name%.*}"
+  mt="$(stat -c %Y -- "$file" 2>/dev/null || echo 0)"
+  out="$cache/${name}-${mt}.pdf"
+  if [ ! -f "$out" ]; then
+    soffice --headless "-env:UserInstallation=file:///tmp/ide-${IDE_ID}-loprofile" \
+      --convert-to pdf --outdir "$cache" -- "$file" >/dev/null 2>&1 || return 1
+    [ -f "$cache/${name}.pdf" ] && mv -f "$cache/${name}.pdf" "$out"
+  fi
+  [ -f "$out" ] && printf '%s' "$out"
+}
+
+visidata_bin() { command -v visidata 2>/dev/null || command -v vd 2>/dev/null; }
+
+# ---- dispatch by category --------------------------------------------------
+do_view() {
+  local file; file="$(abspath "$1")"
+  local cat title; cat="$(category_of "$file")"; title="$(basename "$file")"
+  case "$cat" in
+    markdown)
+      launch_overlay view "$file" 0 "$title" ide-view-md "$file" ;;
+    html)
+      local prof; prof="$(carbonyl_profile)"
+      launch_overlay view "$file" 1 "🌐 $title" \
+        carbonyl --graphics --user-data-dir="$prof" "file://$file" ;;
+    image)
+      launch_overlay view "$file" 1 "$title" ide-view-image "$file" ;;
+    video)
+      launch_overlay view "$file" 1 "$title" mpv --vo=kitty --loop-file=no "$file" ;;
+    audio)
+      launch_overlay view "$file" 0 "♪ $title" mpv "$file" ;;
+    pdf)
+      view_pdf "$file" "$title" ;;
+    csv|sheet)
+      local vd; vd="$(visidata_bin)"
+      if [ -n "$vd" ]; then launch_overlay view "$file" 0 "$title" "$vd" "$file"
+      else notify "visidata not installed; editing raw"; do_edit "$file"; fi ;;
+    document|slides)
+      local pdf; pdf="$(office_to_pdf "$file")"
+      if [ -n "$pdf" ]; then view_pdf "$pdf" "$title" "$file"
+      else notify "office->pdf failed (is libreoffice installed?); editing raw"; do_edit "$file"; fi ;;
+    *)
+      do_edit "$file" ;;
+  esac
+}
+
+do_edit() {
+  local file; file="$(abspath "$1")"
+  launch_overlay edit "$file" 0 "$(basename "$file")" nvim "$file"
+}
+
+do_open() {
+  local file="$1"
+  [ -n "$file" ] || exit 0
+  local cat; cat="$(category_of "$(abspath "$file")")"
+  if [ "$(default_mode_of "$cat")" = view ]; then do_view "$file"; else do_edit "$file"; fi
+}
+
+do_browser() {
+  local url="${1:-https://arxiv.org}" prof; prof="$(carbonyl_profile)"
+  launch_overlay view "" 1 "🌐 web" carbonyl --graphics --user-data-dir="$prof" "$url"
+}
+
+# Open an office doc for real WYSIWYG editing in the Virtual Desktop (LibreOffice
+# GUI). Only files under the VD bind-mount (~/projects -> /work) are reachable.
+edit_in_vd() {
+  local file="$1" mount="$HOME/projects"
+  case "$file" in
+    "$mount"/*)
+      ide-vd launch soffice "/work/${file#$mount/}" >/dev/null 2>&1 &
+      ide-pane vd >/dev/null 2>&1 ;;
+    *)
+      notify "to edit office docs in the desktop, put the file under ~/projects" ;;
+  esac
+}
+
+# Report the focused doc as: <id>\t<vmode>\t<file>
+focused_doc() {
+  kitty @ --to "$sock" ls 2>/dev/null | python3 -c '
+import sys, json
+for w in json.load(sys.stdin):
+  for t in w["tabs"]:
+    for win in t["windows"]:
+      v = win.get("user_vars", {})
+      if v.get("doc") == "1" and win.get("is_focused"):
+        print("%s\t%s\t%s" % (win["id"], v.get("vmode", ""), v.get("file", "")))
+        raise SystemExit
+'
+}
+
+close_doc() { kitty @ --to "$sock" close-window --match "id:$1" >/dev/null 2>&1; }
+
+# Flip the focused tab between rendered view and editable.
+do_toggle() {
+  local line id vmode file; line="$(focused_doc)"
+  IFS=$'\t' read -r id vmode file <<<"$line"
+  [ -n "$file" ] || exit 0           # browser tab / nothing focused -> no-op
+  local cat; cat="$(category_of "$file")"
+  case "$cat" in video|audio|pdf) exit 0;; esac   # no editable counterpart
+  if [ "$vmode" = view ]; then
+    case "$cat" in
+      sheet|document|slides) edit_in_vd "$file" ;;  # leaves the view tab open
+      *)                     close_doc "$id"; do_edit "$file" ;;
+    esac
+  else
+    close_doc "$id"; do_view "$file"
+  fi
+}
 
 case "$mode" in
-  edit)
-    [ -n "$arg" ] || exit 0
-    id=$(kitty @ --to "$sock" launch --type=overlay --cwd="$(dirname "$arg")" \
-      --var doc=1 --var title="$(basename "$arg")" nvim "$arg" 2>/dev/null) ;;
-  pdf)
-    [ -n "$arg" ] || exit 0
-    if command -v tdf >/dev/null; then prog=tdf; else prog=kpdf; fi
-    # live_resize: tdf renders pages via the kitty graphics protocol, so it must
-    # keep getting SIGWINCH during a border drag to re-fit (see kitty patch 3).
-    id=$(kitty @ --to "$sock" launch --type=overlay --cwd="$(dirname "$arg")" \
-      --var doc=1 --var live_resize=1 --var title="$(basename "$arg")" "$prog" "$arg" 2>/dev/null)
-    # tdf opens fit-to-screen -- pages render tiny/unreadable; its `z` key toggles
-    # fill-screen ("zoom") mode. Auto-press it once so PDFs open readable. It's a
-    # *toggle*, so send exactly one `z`, and only after a beat: tdf reads stdin
-    # during startup to detect kitty graphics, and an earlier keystroke would be
-    # swallowed by that handshake.
-    if [ "$prog" = tdf ] && [ -n "$id" ]; then
-      ( sleep 0.5; kitty @ --to "$sock" send-text --match "id:$id" z ) >/dev/null 2>&1 &
-    fi
-    ;;
-  browser)
-    url="${arg:-https://arxiv.org}"
-    # --graphics: render the page crisply via kitty's graphics protocol
-    # (patched libcarbonyl) instead of blocky half-blocks. live_resize keeps the
-    # SIGWINCH flowing during a border drag so the page re-blits to track it.
-    id=$(kitty @ --to "$sock" launch --type=overlay \
-      --var doc=1 --var live_resize=1 --var title="🌐 web" carbonyl --graphics "$url" 2>/dev/null) ;;
+  open)    do_open "$arg" ;;
+  view)    [ -n "$arg" ] && do_view "$arg" ;;
+  edit)    [ -n "$arg" ] && do_edit "$arg" ;;
+  pdf)     [ -n "$arg" ] && view_pdf "$(abspath "$arg")" "$(basename "$arg")" ;;
+  browser) do_browser "$arg" ;;
+  toggle)  do_toggle ;;
 esac
 
-[ -n "$id" ] && echo "$id" > "$IDE_ACTIVE_DOC"   # remember the active document for ide-pane
+[ -n "${id:-}" ] && echo "$id" > "$IDE_ACTIVE_DOC"   # remember active doc for ide-pane
 touch "$IDE_TABS_DIRTY"

@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       x11-utils x11-xserver-utils dbus-x11 \
       # a real browser for testing web front-ends
       chromium \
+      # office suite: GUI editing of docx/pptx/xlsx opened from the editor pane
+      libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-gtk3 \
       # runtimes apps commonly need
       nodejs npm python3 python3-pip python3-venv \
       # plumbing

@@ -1,20 +1,215 @@
 #!/usr/bin/env python3
 # Idle animation for the IDE editor pane, shown when no document is open.
-# A sleeping cat (Braille art) with rising z's. Centered, resize-aware.
-import sys, time, shutil, os, select
+#
+# Preferred renderer: a colour pixel-art sleeping kitten, played via the kitty
+# graphics protocol. Python drives the loop, redisplaying one frame per tick at
+# a fixed image id / placement (a=T) — this animates identically in split panes,
+# overlays and full windows, unlike the native a=a animation which is flaky in
+# splits. The sprite is sized from real cell pixels (TIOCGWINSZ) so the square
+# frame stays square. Frames live in assets/kitty_idle/frame_NNN.png
+# (transparent background, native 24fps rate).
+#
+# Fallback renderer: the original Braille-art sleeping cat with rising z's, used
+# when we're not in a kitty graphics terminal or the frames are missing.
+import sys, time, shutil, os, select, glob, base64, signal, struct
 try:
-    import termios
+    import termios, fcntl
 except ImportError:
-    termios = None
+    termios = fcntl = None
 
 ESC = "\033"
 def fg(h): return f"{ESC}[38;2;{int(h[1:3],16)};{int(h[3:5],16)};{int(h[5:7],16)}m"
 RST = f"{ESC}[0m"
-CAT_COL, Z_COL, HINT_COL = fg("#cdd6f4"), fg("#cba6f7"), fg("#6c7086")
 
-# Sleeping cat, drawn in Unicode Braille. Kept verbatim; the blank cells are
-# Braille-space (U+2800), so redrawing the whole grid each frame paints over
-# (and clears) the previous frame's z's wherever they sat.
+HINT = "open a file from the explorer    ·    tex/md → editor    ·    pdf → reader"
+HINT_COL = fg("#6c7086")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FRAME_DIR = os.path.join(HERE, "assets", "kitty_idle")
+CAT_DIR = os.path.join(FRAME_DIR, "cat")   # cat-body-only frames (zzz removed)
+ZZZ_DIR = os.path.join(FRAME_DIR, "zzz")   # zzz-only frames (cat removed)
+FPS = 24.0
+CAT_EVERY = 3            # cat body animates only every Nth loop; else it holds
+                         # still on frame 0. The zzz drift every loop.
+
+# ── shared tty setup ────────────────────────────────────────────────────────
+def setup_tty(fd):
+    # The idle screen is not an input surface: no-echo, non-canonical so stray
+    # keystrokes typed here aren't echoed onto the animation.
+    if termios is None or not sys.stdin.isatty():
+        return None
+    try:
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return old
+    except Exception:
+        return None
+
+def drain_stdin(fd):
+    while select.select([sys.stdin], [], [], 0)[0]:
+        try:
+            if not os.read(fd, 4096):
+                break
+        except OSError:
+            break
+
+# ── kitty graphics renderer ─────────────────────────────────────────────────
+def in_kitty_graphics():
+    return os.environ.get("TERM", "").startswith("xterm-kitty") or \
+           "KITTY_WINDOW_ID" in os.environ
+
+def _read_dir(d):
+    out = []
+    for p in sorted(glob.glob(os.path.join(d, "frame_*.png"))):
+        try:
+            with open(p, "rb") as f:
+                out.append(f.read())
+        except OSError:
+            pass
+    return out
+
+def load_frames():
+    # Prefer the split cat/zzz layers (so the cat can hold still while the zzz
+    # keep drifting). Fall back to the flat single-layer frames if the split
+    # dirs are missing. Returns (cat_frames, zzz_frames) — zzz is None for flat.
+    cat = _read_dir(CAT_DIR)
+    zzz = _read_dir(ZZZ_DIR)
+    if cat and zzz and len(cat) == len(zzz):
+        return cat, zzz
+    return _read_dir(FRAME_DIR), None
+
+CAT_ID = 0xA71           # stable image id for the cat-body layer (drawn below)
+ZZZ_ID = 0xA72           # stable image id for the zzz layer (drawn on top)
+def _gfx(ctrl, payload=b""):
+    # Emit one graphics-protocol command, chunking the base64 payload at 4096B.
+    if not payload:
+        sys.stdout.write(f"{ESC}_G{ctrl};{ESC}\\")
+        return
+    b = base64.standard_b64encode(payload)
+    i, n = 0, len(b)
+    first = True
+    while i < n:
+        chunk = b[i:i + 4096]
+        i += 4096
+        more = 1 if i < n else 0
+        head = ctrl if first else ""
+        sep = "," if (head and not head.endswith(",")) else ""
+        sys.stdout.write(f"{ESC}_G{head}{sep}m={more};{chunk.decode('ascii')}{ESC}\\")
+        first = False
+
+PLACEMENT = 1             # fixed placement id, so each redraw replaces the last
+def gfx_show_frame(png, cols, rows, img_id, z):
+    # Transmit + display a frame at image id img_id / placement PLACEMENT, at
+    # stacking order z (higher = on top). Reusing the same i/p replaces that
+    # layer in place — no stacking, no flicker — and Python driving every frame
+    # works identically in split panes, overlays and full windows (unlike the
+    # native a=a animation). The cursor must already sit at the image origin;
+    # C=1 keeps it there so both layers land at the same spot.
+    _gfx(f"a=T,i={img_id},p={PLACEMENT},f=100,q=2,c={cols},r={rows},z={z},C=1", png)
+
+def gfx_clear():
+    for img_id in (CAT_ID, ZZZ_ID):
+        _gfx(f"a=d,d=i,i={img_id},q=2")   # delete each layer + its placements
+
+def cell_pixels(fd):
+    # Real cell size in pixels via TIOCGWINSZ, so we can keep the square sprite
+    # square regardless of the terminal's cell aspect ratio. Returns
+    # (cell_w, cell_h, cols, rows) or None if the terminal doesn't report pixels.
+    if fcntl is None:
+        return None
+    try:
+        buf = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, xpix, ypix = struct.unpack("HHHH", buf)
+        if cols and rows and xpix and ypix:
+            return xpix / cols, ypix / rows, cols, rows
+    except Exception:
+        pass
+    return None
+
+def compute_geometry(fd):
+    # Decide how many cells the square sprite should span, and where to put it.
+    cp = cell_pixels(fd)
+    if cp:
+        cw, ch, cols, rows = cp
+        # Target a square ~62% of the pane height, but never wider than the pane.
+        side_px = min(ch * rows * 0.62, cw * cols * 0.92)
+        c = max(1, round(side_px / cw))
+        r = max(1, round(side_px / ch))
+    else:
+        size = shutil.get_terminal_size((80, 24))
+        cols, rows = size.columns, size.lines
+        # No pixel info: assume cells are ~1:2 (w:h) so a square needs c ≈ 2·r.
+        r = max(6, min(rows - 4, int(rows * 0.5)))
+        c = min(cols, r * 2)
+    x = max(0, (cols - c) // 2)
+    y = max(0, (rows - r - 2) // 2)
+    return c, r, x, y, cols, rows
+
+def run_kitty(fd, cat_frames, zzz_frames):
+    sys.stdout.write(f"{ESC}]2;content{ESC}\\{ESC}[?25l")  # title + hide cursor
+    sys.stdout.flush()
+    resized = {"flag": True}
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__("flag", True))
+    geom = None
+    n = len(cat_frames)
+    layered = zzz_frames is not None      # two-layer mode vs flat single layer
+    t = 0
+    last_cat = None                       # last cat frame index actually drawn
+    period = 1.0 / FPS
+
+    def origin(y, x):
+        sys.stdout.write(f"{ESC}[{y + 1};{x + 1}H")   # cursor → image origin
+
+    try:
+        while True:
+            t0 = time.monotonic()
+            drain_stdin(fd)
+            if resized["flag"]:
+                resized["flag"] = False
+                c, r, x, y, cols, rows = compute_geometry(fd)
+                if geom != (c, r, x, y):
+                    geom = (c, r, x, y)
+                    last_cat = None       # force a redraw of the cat layer
+                    gfx_clear()
+                    sys.stdout.write(f"{ESC}[2J")
+                    hint_x = max(0, (cols - len(HINT)) // 2)
+                    sys.stdout.write(f"{ESC}[{y + r + 2};{hint_x + 1}H{HINT_COL}{HINT}{RST}")
+            c, r, x, y = geom
+            phase = t % n
+            loop = t // n
+            if layered:
+                # The cat body only animates every CAT_EVERY-th loop; otherwise it
+                # holds still on frame 0. The zzz layer drifts on every loop.
+                cat_active = (loop % CAT_EVERY == CAT_EVERY - 1)
+                cat_idx = phase if cat_active else 0
+                if cat_idx != last_cat:          # only resend the cat when it changes
+                    origin(y, x)
+                    gfx_show_frame(cat_frames[cat_idx], c, r, CAT_ID, 0)
+                    last_cat = cat_idx
+                origin(y, x)
+                gfx_show_frame(zzz_frames[phase], c, r, ZZZ_ID, 1)
+            else:
+                origin(y, x)
+                gfx_show_frame(cat_frames[phase], c, r, CAT_ID, 0)
+            sys.stdout.flush()
+            t = (t + 1) % (n * CAT_EVERY)        # keep the loop counter bounded
+            dt = time.monotonic() - t0
+            if dt < period:
+                time.sleep(period - dt)
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        try:
+            gfx_clear()
+            sys.stdout.write(f"{ESC}[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+# ── Braille fallback renderer (original) ─────────────────────────────────────
+CAT_COL, Z_COL = fg("#cdd6f4"), fg("#cba6f7")
 CAT = '''
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⣉⣙⣷⡦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -35,15 +230,9 @@ CAT = '''
 ⠀⠀⠉⠀⠈⠷⣄⡀⠀⠀⠀⠀⠀⠀⠀⠈⢿⡗⠚⡏⠀⢀⣤⡶⠛⠋⠉⠉⠉⠉⠀⣠⣾⠟⢁⣀⣤⣶⣿⠟⠁⠀
 ⠀⠀⠀⠀⠀⠀⠀⠈⠉⠑⠲⠤⣄⣦⣤⡴⠞⠁⠀⠉⠙⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠹⠿⠾⠾⠟⠛⠁⠀⠀⠀⠀
 '''.strip("\n").split("\n")
-
-HINT = "open a file from the explorer    ·    tex/md → editor    ·    pdf → reader"
-
-# The art's top rows are the cat's own sleepy z's. Split them off and animate
-# just those -- lifting them up off the cat and looping -- while the cat below
-# stays put. (rows 0..ZSPLIT-1 = the z's, the rest = the cat.)
 ZSPLIT = 6
-MAXRISE = 4                 # how far (rows) the z's drift up before looping
-ZBASE = (203, 166, 247)     # z colour (#cba6f7), faded toward the bg as they rise
+MAXRISE = 4
+ZBASE = (203, 166, 247)
 BG = (30, 30, 46)
 Z_ART = CAT[:ZSPLIT]
 CAT_ART = CAT[ZSPLIT:]
@@ -52,57 +241,34 @@ def zfade(off):
     c = tuple(int(ZBASE[k] * (1 - t) + BG[k] * t) for k in range(3))
     return f"{ESC}[38;2;{c[0]};{c[1]};{c[2]}m"
 
-def main():
-    # The idle screen is not an input surface: put the tty in no-echo,
-    # non-canonical mode so keystrokes typed here aren't echoed onto the
-    # animation, and drain them each frame so nothing leaks through.
-    fd = sys.stdin.fileno()
-    old_attr = None
-    if termios is not None and sys.stdin.isatty():
-        try:
-            old_attr = termios.tcgetattr(fd)
-            new_attr = termios.tcgetattr(fd)
-            new_attr[3] &= ~(termios.ECHO | termios.ICANON)   # lflags
-            termios.tcsetattr(fd, termios.TCSANOW, new_attr)
-        except Exception:
-            old_attr = None
-
-    sys.stdout.write(f"{ESC}]2;content{ESC}\\{ESC}[?25l")  # title + hide cursor
+def run_braille(fd):
+    sys.stdout.write(f"{ESC}]2;content{ESC}\\{ESC}[?25l")
     sys.stdout.flush()
     last_size = None
     frame = 0
     try:
         while True:
-            while select.select([sys.stdin], [], [], 0)[0]:   # discard idle-pane keystrokes
-                try:
-                    if not os.read(fd, 4096):
-                        break
-                except OSError:
-                    break
+            drain_stdin(fd)
             size = shutil.get_terminal_size((80, 24))
             cols, rows = size.columns, size.lines
             cat_w = max(len(l) for l in CAT)
             cat_h = len(CAT)
             cx = max(0, (cols - cat_w) // 2)
             cy = max(MAXRISE + 1, (rows - cat_h) // 2)
-            off = (frame // 3) % (MAXRISE + 1)   # z lift, 0..MAXRISE, looping
+            off = (frame // 3) % (MAXRISE + 1)
             buf = []
             if last_size != (cols, rows):
-                buf.append(f"{ESC}[2J")          # full clear only on first frame / resize
+                buf.append(f"{ESC}[2J")
                 last_size = (cols, rows)
-            # clear the z fly-zone above the cat so risen z's leave no trail
             for r in range(max(1, cy - MAXRISE), cy + ZSPLIT):
                 buf.append(f"{ESC}[{r};{cx}H" + " " * cat_w)
-            # the cat body (static), sitting below the z's
             for i, line in enumerate(CAT_ART):
                 buf.append(f"{ESC}[{cy+ZSPLIT+i};{cx}H{CAT_COL}{line}{RST}")
-            # the cat's z's, lifted up by `off` and fading as they rise
             zcol = zfade(off)
             for i, line in enumerate(Z_ART):
                 rr = cy + i - off
                 if rr >= 1:
                     buf.append(f"{ESC}[{rr};{cx}H{zcol}{line}{RST}")
-            # dim hint below
             hint_x = max(0, (cols - len(HINT)) // 2)
             buf.append(f"{ESC}[{cy+cat_h+2};{hint_x}H{HINT_COL}{HINT}{RST}")
             sys.stdout.write("".join(buf))
@@ -112,11 +278,23 @@ def main():
     except (KeyboardInterrupt, BrokenPipeError):
         pass
     finally:
+        sys.stdout.write(f"{ESC}[?25h")
+        sys.stdout.flush()
+
+# ── entry ────────────────────────────────────────────────────────────────────
+def main():
+    fd = sys.stdin.fileno()
+    old_attr = setup_tty(fd)
+    try:
+        cat_frames, zzz_frames = load_frames() if in_kitty_graphics() else ([], None)
+        if cat_frames:
+            run_kitty(fd, cat_frames, zzz_frames)
+        else:
+            run_braille(fd)
+    finally:
         if old_attr is not None:
             try: termios.tcsetattr(fd, termios.TCSANOW, old_attr)
             except Exception: pass
-        sys.stdout.write(f"{ESC}[?25h")
-        sys.stdout.flush()
 
 if __name__ == "__main__":
     main()

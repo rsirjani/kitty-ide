@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# Interactive image viewer for the IDE editor pane.
+#
+# Renders at the image's ORIGINAL resolution by default (1:1 pixels -- no blurry
+# upscaling), and lets you zoom and pan:
+#
+#   +/=  zoom in        -/_  zoom out        0  reset to 1:1 (native)
+#   f    fit to pane     arrows / h j k l    pan
+#   mouse wheel zoom     click-drag to pan   q / Esc  close the tab
+#
+# It composes each frame with PIL (crop the visible region at the current zoom,
+# paste onto a pane-sized canvas) and blits it with `kitten icat`, re-rendering
+# on SIGWINCH so it tracks border drags (the overlay sets --var live_resize=1).
+import sys, os, re, signal, select, struct, fcntl, termios, tty, subprocess
+from PIL import Image
+
+BG = (30, 30, 46)                                   # Catppuccin Mocha base
+SHM = f"/dev/shm/ide-imgview-{os.getpid()}.png"
+
+def load(path):
+    im = Image.open(path)
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, BG)
+        bg.paste(im, mask=im.split()[-1])
+        return bg
+    return im.convert("RGB")
+
+class Viewer:
+    def __init__(self, path):
+        self.path = path
+        self.src = load(path)
+        self.SW, self.SH = self.src.size
+        self.zoom = 1.0                              # 1.0 == native pixels
+        self.cx, self.cy = self.SW / 2, self.SH / 2  # pan center, in source px
+        # last frame geometry (set by compose) so input handlers can pan/zoom
+        self.cell_w = self.cell_h = 1
+        self.scale = 1.0
+
+    # --- geometry / framing ---------------------------------------------
+    def term_size(self):
+        rows, cols, xp, yp = 24, 80, 0, 0
+        try:
+            r = fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8)
+            rows, cols, xp, yp = struct.unpack("HHHH", r)
+        except Exception:
+            pass
+        if xp == 0 or yp == 0:
+            q = self.query_pixels()
+            if q:
+                xp, yp = q
+            else:
+                xp, yp = cols * 8, rows * 16          # last-ditch cell guess
+        return rows, cols, xp, yp
+
+    def query_pixels(self):
+        # CSI 14 t  ->  CSI 4 ; <height> ; <width> t
+        try:
+            os.write(1, b"\033[14t")
+            buf = b""
+            for _ in range(40):
+                r, _, _ = select.select([0], [], [], 0.01)
+                if r:
+                    buf += os.read(0, 64)
+                    if b"t" in buf:
+                        break
+            m = re.search(rb"\033\[4;(\d+);(\d+)t", buf)
+            if m:
+                return int(m.group(2)), int(m.group(1))   # (w, h)
+        except Exception:
+            pass
+        return None
+
+    def fit_zoom(self, cvw, cvh):
+        return min(cvw / self.SW, cvh / self.SH)
+
+    def compose(self, cols, rows, xp, yp):
+        """Build the pane-sized RGB canvas for the current zoom/pan. Pure: lets
+        the render path and an offline test share identical framing math."""
+        cell_w = max(1, xp // max(1, cols))
+        cell_h = max(1, yp // max(1, rows))
+        irows = max(1, rows - 1)                      # bottom row = status line
+        cvw, cvh = cell_w * cols, cell_h * irows
+        self.cell_w, self.cell_h, self.irows = cell_w, cell_h, irows
+        self.scale = scale = self.zoom
+
+        vis_w, vis_h = cvw / scale, cvh / scale       # source px visible
+        self.vis_w, self.vis_h = vis_w, vis_h
+        # clamp the pan center to the image (with no margin) so edges stay reachable
+        self.cx = min(max(self.cx, 0), self.SW)
+        self.cy = min(max(self.cy, 0), self.SH)
+        left, top = self.cx - vis_w / 2, self.cy - vis_h / 2
+
+        canvas = Image.new("RGB", (cvw, cvh), BG)
+        ix0, iy0 = max(0, int(round(left))), max(0, int(round(top)))
+        ix1 = min(self.SW, int(round(left + vis_w)))
+        iy1 = min(self.SH, int(round(top + vis_h)))
+        if ix1 > ix0 and iy1 > iy0:
+            crop = self.src.crop((ix0, iy0, ix1, iy1))
+            dw, dh = int(round((ix1 - ix0) * scale)), int(round((iy1 - iy0) * scale))
+            if dw > 0 and dh > 0:
+                crop = crop.resize((dw, dh), Image.NEAREST if scale >= 1 else Image.LANCZOS)
+                px, py = int(round((ix0 - left) * scale)), int(round((iy0 - top) * scale))
+                canvas.paste(crop, (px, py))
+        return canvas, cols, irows
+
+    # --- drawing --------------------------------------------------------
+    def render(self, *_):
+        rows, cols, xp, yp = self.term_size()
+        canvas, c, r = self.compose(cols, rows, xp, yp)
+        tmp = SHM + ".tmp"
+        canvas.save(tmp, "PNG")
+        os.replace(tmp, SHM)                          # atomic -> icat never reads a half file
+        subprocess.run(["kitty", "+kitten", "icat", "--clear",
+                        "--place", f"{c}x{r}@0x0", SHM],
+                       stdout=sys.stdout.buffer, stderr=subprocess.DEVNULL, check=False)
+        pct = int(round(self.zoom * 100))
+        status = (f" {os.path.basename(self.path)}  {self.SW}×{self.SH}  zoom {pct}%   "
+                  f"+/- zoom · arrows/drag pan · f fit · 0 native · q quit ")
+        sys.stdout.write(f"\033[{rows};1H\033[2K\033[7m{status[:cols]}\033[0m")
+        sys.stdout.flush()
+
+    # --- interaction ----------------------------------------------------
+    def zoom_by(self, factor):
+        self.zoom = min(64.0, max(0.02, self.zoom * factor))
+
+    def pan_cells(self, dxc, dyc):
+        # move the view by whole cells, converted to source px at current scale
+        self.cx += dxc * self.cell_w / self.scale
+        self.cy += dyc * self.cell_h / self.scale
+
+    def handle(self, buf):
+        """Consume as much of buf as forms complete sequences; return the rest
+        and whether to quit."""
+        quit = False
+        while buf:
+            m = re.match(r"\033\[<(\d+);(\d+);(\d+)([Mm])", buf)
+            if m:
+                b, x, y, typ = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+                buf = buf[m.end():]
+                if b == 64:   self.zoom_by(1.25); self.render()
+                elif b == 65: self.zoom_by(1/1.25); self.render()
+                elif b == 0 and typ == "M":
+                    self._drag = (x, y)
+                elif typ == "m":
+                    self._drag = None
+                elif b in (32, 35) and getattr(self, "_drag", None):
+                    px, py = self._drag
+                    self.pan_cells(px - x, py - y); self._drag = (x, y); self.render()
+                continue
+            for seq, dx, dy in (("\033[A", 0, -2), ("\033[B", 0, 2),
+                                 ("\033[C", 2, 0), ("\033[D", -2, 0)):
+                if buf.startswith(seq):
+                    self.pan_cells(dx, dy); self.render(); buf = buf[len(seq):]; break
+            else:
+                ch = buf[0]; buf = buf[1:]
+                if ch in "+=":      self.zoom_by(1.25); self.render()
+                elif ch in "-_":    self.zoom_by(1/1.25); self.render()
+                elif ch == "0":     self.zoom = 1.0; self.cx, self.cy = self.SW/2, self.SH/2; self.render()
+                elif ch in "fF":    self._fit(); self.render()
+                elif ch in "hH":    self.pan_cells(-2, 0); self.render()
+                elif ch in "lL":    self.pan_cells(2, 0); self.render()
+                elif ch in "kK":    self.pan_cells(0, -2); self.render()
+                elif ch in "jJ":    self.pan_cells(0, 2); self.render()
+                elif ch in ("q", "\033"): quit = True
+            if buf and buf[0] == "\033" and not buf.startswith("\033["):
+                # lone ESC left over -> treat as quit
+                if len(buf) == 1:
+                    quit = True; buf = ""
+        return buf, quit
+
+    def _fit(self):
+        rows, cols, xp, yp = self.term_size()
+        cell_w = max(1, xp // max(1, cols)); cell_h = max(1, yp // max(1, rows))
+        self.zoom = self.fit_zoom(cell_w * cols, cell_h * max(1, rows - 1))
+        self.cx, self.cy = self.SW / 2, self.SH / 2
+
+    def run(self):
+        fd = 0
+        old = termios.tcgetattr(fd); tty.setcbreak(fd)
+        sys.stdout.write("\033[?25l\033[?1000;1002;1006h"); sys.stdout.flush()
+        signal.signal(signal.SIGWINCH, self.render)
+        self.render()
+        buf = ""
+        try:
+            while True:
+                r, _, _ = select.select([fd], [], [], 0.2)
+                if not r:
+                    continue
+                try:
+                    buf += os.read(fd, 4096).decode("utf-8", "replace")
+                except OSError:
+                    continue
+                buf, quit = self.handle(buf)
+                if quit:
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sys.stdout.write("\033[?1000;1002;1006l\033[?25h")
+            subprocess.run(["kitty", "+kitten", "icat", "--clear"],
+                           stdout=sys.stdout.buffer, stderr=subprocess.DEVNULL, check=False)
+            sys.stdout.flush()
+            try: os.remove(SHM)
+            except OSError: pass
+
+def main():
+    if len(sys.argv) < 2:
+        return
+    try:
+        Viewer(sys.argv[1]).run()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()

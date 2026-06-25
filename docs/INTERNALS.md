@@ -16,10 +16,15 @@ splits tree:  [ [explorer, [tabbar, content]], claude ]
 - **claude** runs a shell (`pane=claude`).
 
 Documents don't replace `content` — they open as kitty **overlays** over it
-(`ide-open` → `kitty @ launch --type=overlay --var doc=1 …`). Overlays keep the
-kitty graphics protocol intact (needed for carbonyl/tdf), which a multiplexer
-would strip. `ide-tabbar` lists every overlay with `doc=1` as a tab, highlights
-the focused one, and on click focuses it / closes it / opens a browser.
+(`ide-open` → `kitty @ launch --type=overlay --next-to var:pane=content --var
+doc=1 …`). The `--next-to var:pane=content` anchors the overlay to the content
+pane explicitly: `ide-open` is invoked from whichever pane fired it (the tab-bar
+on `+ web`, the claude pane on a clicked link), and with `focus_follows_mouse`
+the pointer can snap focus back there before the overlay lands — so without the
+anchor a doc could open over the 1-row tab-bar or the claude pane. Overlays keep
+the kitty graphics protocol intact (needed for carbonyl/tdf), which a
+multiplexer would strip. `ide-tabbar` lists every overlay with `doc=1` as a tab,
+highlights the focused one, and on click focuses it / closes it / opens a browser.
 `ide-tab` does the same by keyboard; `ide-pane` switches between the three zones.
 
 In the explorer, `yazi/init.lua` overrides `Entity:click` to add **double-click
@@ -177,6 +182,24 @@ The `cd` is sent via `kitty @ send-text`.
 kitty graphics protocol — full resolution, real fonts — instead of half-blocks,
 and resolves bare hosts / search queries in the address bar. Default page is
 arXiv.
+
+carbonyl is Chromium, so two tabs sharing one profile would hit Chromium's
+singleton lock — the second refuses to open while the first is up. `ide-open`
+therefore hands each tab its own `--user-data-dir` from a **persistent pool**
+under `~/.local/share/ide-carbonyl/p<N>`: it reuses the lowest-numbered profile
+not currently held by a running carbonyl, creating it on first use. So with one
+tab open at a time you always land on `p0` and the browser stays logged in
+across sessions (cookies/history persist); extra *concurrent* tabs spill into
+`p1`, `p2`, … (each persistent in its own right). The pool lives under
+`~/.local/share` (not `/tmp`) so it survives reboots.
+
+**Clicking a link** (e.g. a PR/issue URL Claude prints in the claude pane) opens
+it as a browser tab in that same IDE instance, rather than the host's default
+browser. `kitty/ide.conf` sets `open_url_with ide-open-url`; kitty runs that
+handler with `KITTY_LISTEN_ON` pointing at the *clicking* instance's socket, so
+`ide-open-url` just forwards http(s) URLs to `ide-open browser` (which resolves
+the instance via `ide-sock` and anchors the tab to `content`). Non-web URLs fall
+back to `xdg-open`.
 
 ## PDFs
 

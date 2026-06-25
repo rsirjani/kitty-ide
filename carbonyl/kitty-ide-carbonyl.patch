@@ -1,3 +1,441 @@
+diff --git a/src/browser.rs b/src/browser.rs
+index 0d94ea2..0e2ff97 100644
+--- a/src/browser.rs
++++ b/src/browser.rs
+@@ -1,3 +1,4 @@
+ mod bridge;
++pub mod cdp;
+ 
+ pub use bridge::*;
+diff --git a/src/browser/bridge.rs b/src/browser/bridge.rs
+index 7b3d629..84c0bcd 100644
+--- a/src/browser/bridge.rs
++++ b/src/browser/bridge.rs
+@@ -116,10 +116,27 @@ fn main() -> io::Result<Option<i32>> {
+     let mut terminal = input::Terminal::setup();
+     let mut command = Command::new(env::current_exe()?);
+ 
+-    if !cmd.bitmap {
+-        command
+-            .arg("--disable-threaded-scrolling")
+-            .arg("--disable-threaded-animation");
++    // Keep scrolling and animation on the main thread. Carbonyl's custom
++    // renderer drives frames from the browser side, and the off-thread
++    // compositor races it — graphics mode left these on and would segfault on
++    // the first scroll after the page went idle. Disable in every mode.
++    command
++        .arg("--disable-threaded-scrolling")
++        .arg("--disable-threaded-animation");
++
++    // Start Chromium's DevTools endpoint so the clipboard can read the page
++    // selection (and inject pasted text) over CDP — there's no other way to get
++    // text out of the bitmap-rendered page. We pick a free port ourselves and
++    // hand it to the child via env, unless the user already asked for one. The
++    // page is loaded into a private --user-data-dir, so this only exposes that
++    // throwaway profile on localhost.
++    if !cmd.args.iter().any(|a| a.starts_with("--remote-debugging-port")) {
++        if let Some(port) = pick_free_port() {
++            command
++                .arg(format!("--remote-debugging-port={port}"))
++                .arg("--remote-allow-origins=*")
++                .env(crate::browser::cdp::PORT_ENV, port.to_string());
++        }
+     }
+ 
+     let output = command
+@@ -141,6 +158,17 @@ fn main() -> io::Result<Option<i32>> {
+     Ok(Some(code))
+ }
+ 
++/// Ask the OS for an unused localhost TCP port by binding to port 0 and reading
++/// back the assignment. There's a tiny race before Chromium grabs it, but a
++/// fresh ephemeral port is virtually never reused that fast.
++fn pick_free_port() -> Option<u16> {
++    std::net::TcpListener::bind(("127.0.0.1", 0))
++        .ok()?
++        .local_addr()
++        .ok()
++        .map(|addr| addr.port())
++}
++
+ #[no_mangle]
+ pub extern "C" fn carbonyl_bridge_main() {
+     if let Some(code) = main().unwrap() {
+@@ -377,6 +405,11 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
+ 
+                     match event {
+                         Exit => (),
++                        Paste { text } => {
++                            // Inject the clipboard text into the focused element
++                            // over CDP (the terminal handed it to us via OSC 52).
++                            crate::browser::cdp::insert_text(&text);
++                        }
+                         Scroll { delta } => {
+                             let scale = get_scale();
+ 
+diff --git a/src/browser/cdp.rs b/src/browser/cdp.rs
+new file mode 100644
+index 0000000..4960f5a
+--- /dev/null
++++ b/src/browser/cdp.rs
+@@ -0,0 +1,357 @@
++//! Tiny synchronous Chrome DevTools Protocol client.
++//!
++//! Carbonyl rasterizes page text straight into the framebuffer (bitmap mode),
++//! so the selected text never reaches the terminal side — there's nothing local
++//! to put on the clipboard. Instead we ask the very Chromium we're driving:
++//! the launcher starts it with `--remote-debugging-port` (see `bridge.rs`) and
++//! passes the port down in `CARBONYL_CDP_PORT`. On copy we read
++//! `window.getSelection()` over CDP; on paste we push the text back in with
++//! `Input.insertText`.
++//!
++//! It's a hand-rolled, blocking, dependency-free client: one HTTP GET to find
++//! the page target, a WebSocket upgrade, a single request/response. Everything
++//! is wrapped in short timeouts so a copy/paste never stalls rendering, and any
++//! failure degrades to "do nothing".
++
++use std::io::{Read, Write};
++use std::net::TcpStream;
++use std::time::Duration;
++
++use crate::utils::{base64, log};
++
++/// Env var the launcher uses to hand the chosen debug port to the child.
++pub const PORT_ENV: &str = "CARBONYL_CDP_PORT";
++
++const CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
++const IO_TIMEOUT: Duration = Duration::from_millis(800);
++
++/// The configured debugging port, if the launcher set one.
++fn port() -> Option<u16> {
++    std::env::var(PORT_ENV).ok()?.parse().ok()
++}
++
++/// Whether CDP-backed clipboard is available this run.
++pub fn enabled() -> bool {
++    port().is_some()
++}
++
++/// The current page selection as plain text, or `None` if nothing is selected
++/// (or CDP is unreachable).
++pub fn get_selection() -> Option<String> {
++    let resp = call(
++        "Runtime.evaluate",
++        r#"{"expression":"window.getSelection().toString()","returnByValue":true}"#,
++    )?;
++    let text = extract_string_field(&resp, "value")?;
++
++    if text.is_empty() {
++        None
++    } else {
++        Some(text)
++    }
++}
++
++/// Insert `text` at the focused element, as if typed/pasted. Returns whether the
++/// call was dispatched.
++pub fn insert_text(text: &str) -> bool {
++    let params = format!(r#"{{"text":"{}"}}"#, json_escape(text));
++
++    call("Input.insertText", &params).is_some()
++}
++
++/// Make a single CDP call and return the raw JSON response text.
++fn call(method: &str, params: &str) -> Option<String> {
++    let port = port()?;
++    let path = page_ws_path(port)?;
++    let mut ws = ws_connect(port, &path)?;
++
++    let msg = format!(r#"{{"id":1,"method":"{method}","params":{params}}}"#);
++
++    ws_send_text(&mut ws, msg.as_bytes()).ok()?;
++
++    // Read messages until we see our response (id 1), skipping any events.
++    for _ in 0..32 {
++        let frame = ws_read_message(&mut ws)?;
++        let text = String::from_utf8_lossy(&frame);
++
++        if text.contains("\"id\":1") {
++            return Some(text.into_owned());
++        }
++    }
++
++    None
++}
++
++/// Ask the DevTools HTTP endpoint for a page target's WebSocket path.
++fn page_ws_path(port: u16) -> Option<String> {
++    let mut stream = connect(port)?;
++
++    // The Host header must carry the port: Chromium's DevTools rejects requests
++    // whose Host doesn't match as a DNS-rebinding mitigation.
++    let req = format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
++    stream.write_all(req.as_bytes()).ok()?;
++
++    // Read incrementally and stop as soon as the marker appears — DevTools may
++    // hold the connection open (keep-alive), so we can't wait for EOF, and a
++    // read timeout should still let us use whatever arrived.
++    let marker = "/devtools/page/";
++    let mut buf = Vec::new();
++    let mut chunk = [0u8; 4096];
++    loop {
++        match stream.read(&mut chunk) {
++            Ok(0) => break,
++            Ok(n) => {
++                buf.extend_from_slice(&chunk[..n]);
++                if find_sub(&buf, marker.as_bytes()).is_some() {
++                    break;
++                }
++                if buf.len() > 1 << 20 {
++                    break;
++                }
++            }
++            Err(_) => break,
++        }
++    }
++
++    // Grab the first page target's ws URL and keep only the path portion, e.g.
++    // ws://127.0.0.1:PORT/devtools/page/ABC123  ->  /devtools/page/ABC123
++    let body = String::from_utf8_lossy(&buf);
++    let start = body.find(marker)?;
++    let rest = &body[start..];
++    let end = rest.find('"').unwrap_or(rest.len());
++
++    Some(rest[..end].to_string())
++}
++
++/// First index of `needle` in `haystack`.
++fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    haystack
++        .windows(needle.len())
++        .position(|w| w == needle)
++}
++
++/// Open a WebSocket to a DevTools target and complete the upgrade handshake.
++/// We deliberately send no `Origin` header so Chromium's `--remote-allow-origins`
++/// check doesn't reject us.
++fn ws_connect(port: u16, path: &str) -> Option<TcpStream> {
++    let mut stream = connect(port)?;
++
++    // The key needn't be random for a localhost tool; the server's Accept value
++    // is not verified here.
++    let key = base64::encode(b"carbonyl-clip-01");
++    let req = format!(
++        "GET {path} HTTP/1.1\r\n\
++         Host: 127.0.0.1:{port}\r\n\
++         Upgrade: websocket\r\n\
++         Connection: Upgrade\r\n\
++         Sec-WebSocket-Key: {key}\r\n\
++         Sec-WebSocket-Version: 13\r\n\r\n"
++    );
++
++    stream.write_all(req.as_bytes()).ok()?;
++
++    // Read response headers one byte at a time so we don't swallow frame bytes.
++    let mut headers = Vec::new();
++    let mut byte = [0u8; 1];
++    while !headers.ends_with(b"\r\n\r\n") {
++        if stream.read(&mut byte).ok()? == 0 {
++            return None;
++        }
++        headers.push(byte[0]);
++        if headers.len() > 8192 {
++            return None;
++        }
++    }
++
++    if !headers.starts_with(b"HTTP/1.1 101") {
++        log::debug!("CDP websocket upgrade refused");
++        return None;
++    }
++
++    Some(stream)
++}
++
++/// Send a masked text frame. Per RFC 6455 clients must mask; an all-zero mask
++/// is valid and leaves the payload as-is, which keeps this simple.
++fn ws_send_text(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
++    let mut frame = vec![0x81u8]; // FIN + text opcode
++    let len = payload.len();
++
++    if len < 126 {
++        frame.push(0x80 | len as u8);
++    } else if len < 65536 {
++        frame.push(0x80 | 126);
++        frame.extend_from_slice(&(len as u16).to_be_bytes());
++    } else {
++        frame.push(0x80 | 127);
++        frame.extend_from_slice(&(len as u64).to_be_bytes());
++    }
++
++    frame.extend_from_slice(&[0, 0, 0, 0]); // zero mask key
++    frame.extend_from_slice(payload); // payload XOR 0 == payload
++
++    stream.write_all(&frame)
++}
++
++/// Read one full WebSocket message, reassembling continuation frames.
++fn ws_read_message(stream: &mut TcpStream) -> Option<Vec<u8>> {
++    let mut message = Vec::new();
++
++    loop {
++        let mut hdr = [0u8; 2];
++        read_exact(stream, &mut hdr)?;
++
++        let fin = hdr[0] & 0x80 != 0;
++        let opcode = hdr[0] & 0x0f;
++        let masked = hdr[1] & 0x80 != 0;
++        let mut len = (hdr[1] & 0x7f) as usize;
++
++        if len == 126 {
++            let mut ext = [0u8; 2];
++            read_exact(stream, &mut ext)?;
++            len = u16::from_be_bytes(ext) as usize;
++        } else if len == 127 {
++            let mut ext = [0u8; 8];
++            read_exact(stream, &mut ext)?;
++            len = u64::from_be_bytes(ext) as usize;
++        }
++
++        let mut mask = [0u8; 4];
++        if masked {
++            read_exact(stream, &mut mask)?;
++        }
++
++        let mut payload = vec![0u8; len];
++        read_exact(stream, &mut payload)?;
++        if masked {
++            for (i, b) in payload.iter_mut().enumerate() {
++                *b ^= mask[i % 4];
++            }
++        }
++
++        // 0x8 = close. Bail rather than spin.
++        if opcode == 0x8 {
++            return None;
++        }
++
++        message.extend_from_slice(&payload);
++
++        if fin {
++            return Some(message);
++        }
++    }
++}
++
++fn connect(port: u16) -> Option<TcpStream> {
++    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
++    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
++
++    stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
++    stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
++
++    Some(stream)
++}
++
++fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Option<()> {
++    stream.read_exact(buf).ok()
++}
++
++/// Pull `"<field>":"..."` out of a JSON blob and unescape it. Used for the small,
++/// known CDP responses we care about (the selection string).
++fn extract_string_field(json: &str, field: &str) -> Option<String> {
++    let needle = format!("\"{field}\":\"");
++    let start = json.find(&needle)? + needle.len();
++    let bytes = json.as_bytes();
++    let mut out = String::new();
++    let mut i = start;
++
++    while i < bytes.len() {
++        match bytes[i] {
++            b'"' => return Some(out),
++            b'\\' => {
++                i += 1;
++                match bytes.get(i)? {
++                    b'"' => out.push('"'),
++                    b'\\' => out.push('\\'),
++                    b'/' => out.push('/'),
++                    b'n' => out.push('\n'),
++                    b'r' => out.push('\r'),
++                    b't' => out.push('\t'),
++                    b'b' => out.push('\u{08}'),
++                    b'f' => out.push('\u{0c}'),
++                    b'u' => {
++                        let hex = json.get(i + 1..i + 5)?;
++                        let code = u32::from_str_radix(hex, 16).ok()?;
++                        out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
++                        i += 4;
++                    }
++                    other => out.push(*other as char),
++                }
++            }
++            _ => {
++                // Copy a full UTF-8 sequence so multibyte chars survive.
++                let ch_len = utf8_len(bytes[i]);
++                let end = (i + ch_len).min(bytes.len());
++                out.push_str(&json[i..end]);
++                i = end;
++                continue;
++            }
++        }
++        i += 1;
++    }
++
++    None
++}
++
++fn utf8_len(first: u8) -> usize {
++    match first {
++        0x00..=0x7f => 1,
++        0xc0..=0xdf => 2,
++        0xe0..=0xef => 3,
++        _ => 4,
++    }
++}
++
++/// Escape a string for embedding in a JSON string literal.
++fn json_escape(text: &str) -> String {
++    let mut out = String::with_capacity(text.len() + 8);
++
++    for ch in text.chars() {
++        match ch {
++            '"' => out.push_str("\\\""),
++            '\\' => out.push_str("\\\\"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
++            c => out.push(c),
++        }
++    }
++
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn extracts_and_unescapes() {
++        let json = r#"{"id":1,"result":{"result":{"type":"string","value":"line1\ntab\there \"q\" é"}}}"#;
++        assert_eq!(
++            extract_string_field(json, "value").unwrap(),
++            "line1\ntab\there \"q\" é"
++        );
++    }
++
++    #[test]
++    fn empty_value() {
++        let json = r#"{"id":1,"result":{"result":{"type":"string","value":""}}}"#;
++        assert_eq!(extract_string_field(json, "value").unwrap(), "");
++    }
++
++    #[test]
++    fn json_escape_roundtrip_chars() {
++        assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
++    }
++}
 diff --git a/src/cli/cli.rs b/src/cli/cli.rs
 index fc977b7..79c8912 100644
 --- a/src/cli/cli.rs
@@ -81,6 +519,144 @@ index 5a2083d..c5235e8 100644
      -d, --debug                enable debug logs
      -h, --help                 display this help message
      -v, --version              output the version number
+diff --git a/src/input.rs b/src/input.rs
+index f78e753..a0da577 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -2,6 +2,7 @@ mod dcs;
+ mod keyboard;
+ mod listen;
+ mod mouse;
++mod osc;
+ mod parser;
+ mod tty;
+ 
+@@ -9,5 +10,6 @@ pub use dcs::*;
+ pub use keyboard::*;
+ pub use listen::*;
+ pub use mouse::*;
++pub use osc::*;
+ pub use parser::*;
+ pub use tty::*;
+diff --git a/src/input/osc.rs b/src/input/osc.rs
+new file mode 100644
+index 0000000..c7a1bbd
+--- /dev/null
++++ b/src/input/osc.rs
+@@ -0,0 +1,70 @@
++use std::ops::ControlFlow;
++
++use crate::utils::base64;
++
++use super::{Event, ParseControlFlow};
++
++/// Collects an OSC (Operating System Command) string — `ESC ] ... terminator`,
++/// where the terminator is BEL (`0x07`) or ST (`ESC \`). We only care about
++/// OSC 52, the terminal clipboard reply: `52;<targets>;<base64>`. Everything
++/// else is parsed and dropped so it doesn't leak into the page as keystrokes.
++#[derive(Default)]
++pub struct Osc {
++    buf: Vec<u8>,
++    saw_esc: bool,
++}
++
++impl Osc {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn parse(&mut self, key: u8) -> ParseControlFlow {
++        // A pending ESC means we're looking for the `\` of an ST terminator.
++        if self.saw_esc {
++            self.saw_esc = false;
++            // Either way the sequence ends here; `\` is ST, anything else is
++            // malformed and we still stop rather than swallow the stream.
++            return ControlFlow::Break(self.finish());
++        }
++
++        match key {
++            // BEL terminates the OSC.
++            0x07 => ControlFlow::Break(self.finish()),
++            // ESC may begin an ST terminator; wait for the next byte.
++            0x1b => {
++                self.saw_esc = true;
++                ControlFlow::Continue(None)
++            }
++            _ => {
++                // Guard against an unterminated/oversized OSC eating memory.
++                if self.buf.len() < 1 << 20 {
++                    self.buf.push(key);
++                }
++                ControlFlow::Continue(None)
++            }
++        }
++    }
++
++    /// Decode the collected payload into a paste event, if it's an OSC 52
++    /// clipboard reply with valid base64.
++    fn finish(&mut self) -> Option<Event> {
++        let buf = std::mem::take(&mut self.buf);
++        let payload = std::str::from_utf8(&buf).ok()?;
++
++        // `52;<targets>;<base64>` — drop the `52;` and the targets field.
++        let rest = payload.strip_prefix("52;")?;
++        let b64 = rest.splitn(2, ';').nth(1)?;
++
++        // A read query echoes back as `52;c;?`; ignore that, only accept data.
++        if b64 == "?" {
++            return None;
++        }
++
++        let bytes = base64::decode(b64.as_bytes())?;
++
++        Some(Event::Paste {
++            text: String::from_utf8_lossy(&bytes).into_owned(),
++        })
++    }
++}
+diff --git a/src/input/parser.rs b/src/input/parser.rs
+index f27b630..022233f 100644
+--- a/src/input/parser.rs
++++ b/src/input/parser.rs
+@@ -17,6 +17,7 @@ enum Sequence {
+     Mouse(Mouse),
+     Keyboard(Keyboard),
+     DeviceControl(DeviceControl),
++    Osc(Osc),
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -32,6 +33,7 @@ pub enum Event {
+     MouseDown { row: usize, col: usize },
+     MouseMove { row: usize, col: usize },
+     Scroll { delta: isize },
++    Paste { text: String },
+     Terminal(TerminalEvent),
+     Exit,
+ }
+@@ -77,11 +79,13 @@ impl Parser {
+             sequence = match sequence {
+                 Sequence::Char => match key {
+                     0x1b => Sequence::Escape,
+-                    0x03 => emit!(Event::Exit),
++                    // Ctrl+C used to quit; it's now a normal keypress so the
++                    // renderer can treat it as copy (see Renderer::keypress).
+                     key => emit!(Event::KeyPress { key: key.into() }),
+                 },
+                 Sequence::Escape => match key {
+                     b'[' => Sequence::Control,
++                    b']' => Sequence::Osc(Osc::new()),
+                     b'P' => Sequence::DeviceControl(DeviceControl::new()),
+                     0x1b => emit!(Event::KeyPress { key: 0x1b.into() }; continue),
+                     key => {
+@@ -97,6 +101,7 @@ impl Parser {
+                 Sequence::Mouse(ref mut mouse) => parse!(mouse, key),
+                 Sequence::Keyboard(ref mut keyboard) => parse!(keyboard, key),
+                 Sequence::DeviceControl(ref mut dcs) => parse!(dcs, key),
++                Sequence::Osc(ref mut osc) => parse!(osc, key),
+             }
+         }
+ 
 diff --git a/src/output.rs b/src/output.rs
 index 9d16b5f..f32b4ab 100644
 --- a/src/output.rs
@@ -103,10 +679,10 @@ index 9d16b5f..f32b4ab 100644
  pub use render_thread::*;
 diff --git a/src/output/graphics.rs b/src/output/graphics.rs
 new file mode 100644
-index 0000000..426aebf
+index 0000000..bad79c8
 --- /dev/null
 +++ b/src/output/graphics.rs
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,353 @@
 +use std::io::{self, Write};
 +
 +use crate::gfx::Size;
@@ -133,7 +709,17 @@ index 0000000..426aebf
 +    counter: u64,
 +    /// Recently written temp files, reaped once the terminal has read them.
 +    recent: std::collections::VecDeque<String>,
++    /// Magnifier zoom factor. 1.0 fits the whole page into the cell box (the
++    /// default); larger values show a cropped sub-region scaled up.
++    zoom: f32,
++    /// Center of the zoom viewport as a fraction (0..1) of the framebuffer.
++    /// Panning moves this point; it's kept fractional so it survives resizes.
++    center: (f32, f32),
 +}
++
++/// Smallest zoom (whole page) and largest zoom (6x) the magnifier allows.
++const MIN_ZOOM: f32 = 1.0;
++const MAX_ZOOM: f32 = 6.0;
 +
 +impl KittyGraphics {
 +    pub fn new() -> Self {
@@ -143,11 +729,73 @@ index 0000000..426aebf
 +            dirty: false,
 +            counter: 0,
 +            recent: std::collections::VecDeque::new(),
++            zoom: 1.0,
++            center: (0.5, 0.5),
 +        }
 +    }
 +
 +    pub fn dirty(&self) -> bool {
 +        self.dirty
++    }
++
++    /// Whether the magnifier is currently zoomed in past the fit-to-page level.
++    pub fn is_zoomed(&self) -> bool {
++        self.zoom > MIN_ZOOM + 0.001
++    }
++
++    /// Multiply the zoom by `factor`, keeping the view centered, and request a
++    /// redraw. Clamped to the fit-to-page .. max range.
++    pub fn zoom_by(&mut self, factor: f32) {
++        let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
++
++        if zoom != self.zoom {
++            self.zoom = zoom;
++            self.clamp_center();
++            self.dirty = true;
++        }
++    }
++
++    /// Pan the viewport by a fraction of the visible crop in each axis (so a
++    /// step feels the same regardless of zoom level). No-op when not zoomed.
++    pub fn pan_by(&mut self, dx: f32, dy: f32) {
++        if !self.is_zoomed() {
++            return;
++        }
++
++        self.center.0 += dx / self.zoom;
++        self.center.1 += dy / self.zoom;
++        self.clamp_center();
++        self.dirty = true;
++    }
++
++    /// Snap back to the whole, centered page.
++    pub fn reset_view(&mut self) {
++        if self.zoom != 1.0 || self.center != (0.5, 0.5) {
++            self.zoom = 1.0;
++            self.center = (0.5, 0.5);
++            self.dirty = true;
++        }
++    }
++
++    /// Keep the viewport center within the range that keeps the crop fully
++    /// inside the framebuffer, so the magnifier never shows out-of-bounds area.
++    fn clamp_center(&mut self) {
++        let half = 0.5 / self.zoom;
++
++        self.center.0 = self.center.0.clamp(half, 1.0 - half);
++        self.center.1 = self.center.1.clamp(half, 1.0 - half);
++    }
++
++    /// The source sub-rectangle (in framebuffer pixels) currently shown, as
++    /// `(x, y, w, h)`. At zoom 1.0 this is the whole framebuffer.
++    fn crop(&self) -> (u32, u32, u32, u32) {
++        let (sw, sh) = (self.pixels.width, self.pixels.height);
++        let crop_w = ((sw as f32 / self.zoom).round() as u32).clamp(1, sw);
++        let crop_h = ((sh as f32 / self.zoom).round() as u32).clamp(1, sh);
++        let x = ((self.center.0 * sw as f32) - crop_w as f32 / 2.0).max(0.0) as u32;
++        let y = ((self.center.1 * sh as f32) - crop_h as f32 / 2.0).max(0.0) as u32;
++
++        (x.min(sw - crop_w), y.min(sh - crop_h), crop_w, crop_h)
 +    }
 +
 +    /// Store a new framebuffer. `pixels` is BGRA8888, as handed to us by
@@ -222,20 +870,30 @@ index 0000000..426aebf
 +        // Save cursor, move to the content origin.
 +        write!(out, "\x1b7\x1b[{};{}H", row, col)?;
 +
++        // The magnifier shows a sub-rectangle of the framebuffer scaled into the
++        // same cell box: zooming shrinks the crop, panning moves it. At zoom 1.0
++        // the crop is the whole image, so this matches the un-zoomed output.
++        let (crop_x, crop_y, crop_w, crop_h) = self.crop();
++
 +        // a=T  transmit and display
 +        // f=24 raw RGB
 +        // t=t  payload is the path to a temporary file the terminal deletes
-+        // s,v  source size in pixels
-+        // c,r  number of cells to scale the image into
++        // s,v  source size in pixels (the full transmitted framebuffer)
++        // x,y,w,h  source sub-rectangle to display (the magnifier crop)
++        // c,r  number of cells to scale the cropped region into
 +        // i=1  image id (reused each frame, so the terminal replaces the data)
 +        // p=1  placement id (reused, so the terminal replaces the placement)
 +        // q=2  suppress the terminal's success/error replies
 +        // C=1  do not move the cursor when placing the image
 +        write!(
 +            out,
-+            "\x1b_Ga=T,f=24,t=t,s={},v={},c={},r={},i=1,p=1,q=2,C=1;{}\x1b\\",
++            "\x1b_Ga=T,f=24,t=t,s={},v={},x={},y={},w={},h={},c={},r={},i=1,p=1,q=2,C=1;{}\x1b\\",
 +            self.pixels.width,
 +            self.pixels.height,
++            crop_x,
++            crop_y,
++            crop_w,
++            crop_h,
 +            cols,
 +            rows,
 +            base64(path.as_bytes())
@@ -276,8 +934,110 @@ index 0000000..426aebf
 +
 +    out
 +}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Build a graphics backend holding a `w`x`h` framebuffer of dummy pixels.
++    fn with_frame(w: u32, h: u32) -> KittyGraphics {
++        let mut g = KittyGraphics::new();
++        // BGRA8888, contents don't matter for crop geometry.
++        let pixels = vec![0u8; (w * h * 4) as usize];
++        g.store(&pixels, Size::new(w, h));
++        g
++    }
++
++    /// Pull the `key=` integer out of a kitty graphics command string.
++    fn field(cmd: &str, key: &str) -> u32 {
++        let needle = format!(",{key}=");
++        let rest = cmd.split(&needle).nth(1).expect("field present");
++        rest.split(|c: char| !c.is_ascii_digit())
++            .next()
++            .unwrap()
++            .parse()
++            .unwrap()
++    }
++
++    #[test]
++    fn unzoomed_shows_whole_framebuffer() {
++        let mut g = with_frame(800, 600);
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++
++        assert_eq!(field(&cmd, "x"), 0);
++        assert_eq!(field(&cmd, "y"), 0);
++        assert_eq!(field(&cmd, "w"), 800);
++        assert_eq!(field(&cmd, "h"), 600);
++    }
++
++    #[test]
++    fn zoom_in_crops_centered() {
++        let mut g = with_frame(800, 600);
++        g.zoom_by(2.0);
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++
++        // Half-size crop, centered: 400x300 at (200,150).
++        assert_eq!(field(&cmd, "w"), 400);
++        assert_eq!(field(&cmd, "h"), 300);
++        assert_eq!(field(&cmd, "x"), 200);
++        assert_eq!(field(&cmd, "y"), 150);
++    }
++
++    #[test]
++    fn pan_moves_crop_and_clamps_to_edges() {
++        let mut g = with_frame(800, 600);
++        g.zoom_by(2.0);
++
++        // Pan hard left/up many times: the crop must clamp to the top-left.
++        for _ in 0..20 {
++            g.pan_by(-0.15, -0.15);
++        }
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++        assert_eq!(field(&cmd, "x"), 0);
++        assert_eq!(field(&cmd, "y"), 0);
++
++        // Pan hard right/down: clamp to the bottom-right (w-cropw, h-croph).
++        for _ in 0..40 {
++            g.pan_by(0.15, 0.15);
++        }
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++        assert_eq!(field(&cmd, "x"), 400);
++        assert_eq!(field(&cmd, "y"), 300);
++    }
++
++    #[test]
++    fn reset_restores_full_view() {
++        let mut g = with_frame(800, 600);
++        g.zoom_by(3.0);
++        g.pan_by(0.3, 0.3);
++        assert!(g.is_zoomed());
++
++        g.reset_view();
++        assert!(!g.is_zoomed());
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++        assert_eq!(field(&cmd, "w"), 800);
++        assert_eq!(field(&cmd, "h"), 600);
++    }
++
++    #[test]
++    fn zoom_clamps_to_limits() {
++        let mut g = with_frame(800, 600);
++        for _ in 0..50 {
++            g.zoom_by(1.25);
++        }
++        // Never past MAX_ZOOM: crop can't be smaller than width / MAX_ZOOM.
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++        assert_eq!(field(&cmd, "w"), (800.0 / MAX_ZOOM).round() as u32);
++
++        // Zooming out can't go below the whole page.
++        for _ in 0..50 {
++            g.zoom_by(0.8);
++        }
++        assert!(!g.is_zoomed());
++    }
++}
 diff --git a/src/output/renderer.rs b/src/output/renderer.rs
-index f515cad..37614b1 100644
+index f515cad..5286257 100644
 --- a/src/output/renderer.rs
 +++ b/src/output/renderer.rs
 @@ -7,19 +7,24 @@ use unicode_segmentation::UnicodeSegmentation;
@@ -318,7 +1078,88 @@ index f515cad..37614b1 100644
          }
      }
  
-@@ -69,6 +79,14 @@ impl Renderer {
+@@ -37,10 +47,80 @@ impl Renderer {
+     }
+ 
+     pub fn keypress(&mut self, key: &Key) -> io::Result<NavigationAction> {
++        // Magnifier controls (graphics mode only, and never while the address
++        // bar is focused so URL editing keeps the arrow keys). Ctrl+Up/Down
++        // zoom, Ctrl+Left resets, and once zoomed the plain arrows pan. Handled
++        // keys are swallowed (Ignore) so they don't also reach the page.
++        let editing = self.nav.cursor().is_some();
++
++        // Clipboard: Ctrl+C copies the page selection to the system clipboard,
++        // Ctrl+V pastes into the page. Only off the address bar, and only when
++        // the CDP channel that reads/injects page text is available. Page text
++        // is rasterized into the framebuffer and never reaches us directly, so
++        // we ask Chromium for the selection and hand it to the terminal (and
++        // vice-versa for paste) — see `browser::cdp`.
++        if !editing && crate::browser::cdp::enabled() {
++            match key.char {
++                // Ctrl+C
++                0x03 => {
++                    if let Some(text) = crate::browser::cdp::get_selection() {
++                        self.write_clipboard(&text)?;
++                    }
++                    return Ok(NavigationAction::Ignore);
++                }
++                // Ctrl+V — request the clipboard from the terminal; its OSC 52
++                // reply arrives as a paste event we inject into the page.
++                0x16 => {
++                    let mut out = io::stdout();
++                    out.write_all(b"\x1b]52;c;?\x07")?;
++                    out.flush()?;
++                    return Ok(NavigationAction::Ignore);
++                }
++                _ => {}
++            }
++        }
++
++        if let Some(graphics) = &mut self.graphics {
++            if !editing {
++                const STEP: f32 = 0.15;
++                let ctrl = key.modifiers.control;
++                let handled = match (ctrl, key.char) {
++                    // Ctrl+Up / Ctrl+Down: zoom in / out.
++                    (true, 0x11) => Some(graphics.zoom_by(1.25)),
++                    (true, 0x12) => Some(graphics.zoom_by(0.8)),
++                    // Ctrl+Left: reset to the whole page.
++                    (true, 0x14) => Some(graphics.reset_view()),
++                    // Plain arrows pan while zoomed; otherwise fall through.
++                    (false, 0x11) if graphics.is_zoomed() => Some(graphics.pan_by(0.0, -STEP)),
++                    (false, 0x12) if graphics.is_zoomed() => Some(graphics.pan_by(0.0, STEP)),
++                    (false, 0x14) if graphics.is_zoomed() => Some(graphics.pan_by(-STEP, 0.0)),
++                    (false, 0x13) if graphics.is_zoomed() => Some(graphics.pan_by(STEP, 0.0)),
++                    _ => None,
++                };
++
++                if handled.is_some() {
++                    return Ok(NavigationAction::Ignore);
++                }
++            }
++        }
++
+         let action = self.nav.keypress(key);
+ 
+         Ok(action)
+     }
++
++    /// Put `text` on the system clipboard with the OSC 52 terminal escape.
++    fn write_clipboard(&self, text: &str) -> io::Result<()> {
++        let mut out = io::stdout();
++
++        write!(
++            out,
++            "\x1b]52;c;{}\x07",
++            crate::utils::base64::encode(text.as_bytes())
++        )?;
++        out.flush()
++    }
++
+     pub fn mouse_up(&mut self, origin: Point) -> io::Result<NavigationAction> {
+         let action = self.nav.mouse_up(origin);
+ 
+@@ -69,6 +149,14 @@ impl Renderer {
          self.nav.set_size(size);
          self.size = size;
  
@@ -333,7 +1174,7 @@ index f515cad..37614b1 100644
          let mut x = 0;
          let mut y = 0;
          let bound = size.width - 1;
-@@ -120,11 +138,31 @@ impl Renderer {
+@@ -120,11 +208,31 @@ impl Renderer {
  
          self.painter.end(self.nav.cursor())?;
  
@@ -518,5 +1359,110 @@ index 97d669b..3e6662f 100644
 +    #[test]
 +    fn empty_is_blank() {
 +        assert_eq!(resolve_url("   "), "about:blank");
++    }
++}
+diff --git a/src/utils.rs b/src/utils.rs
+index ee68b73..96cb0fc 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -1,6 +1,7 @@
+ mod four_bits;
+ mod try_block;
+ 
++pub mod base64;
+ pub mod log;
+ 
+ use try_block::*;
+diff --git a/src/utils/base64.rs b/src/utils/base64.rs
+new file mode 100644
+index 0000000..ffddb17
+--- /dev/null
++++ b/src/utils/base64.rs
+@@ -0,0 +1,87 @@
++//! Standard base64 (RFC 4648) encode/decode, kept inline to avoid a crate.
++//! Used for the OSC 52 clipboard protocol and CDP payloads.
++
++const ALPHABET: &[u8; 64] =
++    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++/// Encode bytes as standard base64 with `=` padding.
++pub fn encode(data: &[u8]) -> String {
++    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
++
++    for chunk in data.chunks(3) {
++        let n = ((chunk[0] as u32) << 16)
++            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
++            | (*chunk.get(2).unwrap_or(&0) as u32);
++
++        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
++        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
++        out.push(if chunk.len() > 1 {
++            ALPHABET[((n >> 6) & 63) as usize] as char
++        } else {
++            '='
++        });
++        out.push(if chunk.len() > 2 {
++            ALPHABET[(n & 63) as usize] as char
++        } else {
++            '='
++        });
++    }
++
++    out
++}
++
++/// Decode standard base64, ignoring whitespace and padding. Returns `None` on
++/// any invalid (non-alphabet, non-padding, non-whitespace) byte.
++pub fn decode(data: &[u8]) -> Option<Vec<u8>> {
++    let mut out = Vec::with_capacity(data.len() / 4 * 3);
++    let mut acc: u32 = 0;
++    let mut bits = 0u32;
++
++    for &b in data {
++        let val = match b {
++            b'A'..=b'Z' => b - b'A',
++            b'a'..=b'z' => b - b'a' + 26,
++            b'0'..=b'9' => b - b'0' + 52,
++            b'+' => 62,
++            b'/' => 63,
++            b'=' => break,
++            b' ' | b'\t' | b'\r' | b'\n' => continue,
++            _ => return None,
++        } as u32;
++
++        acc = (acc << 6) | val;
++        bits += 6;
++
++        if bits >= 8 {
++            bits -= 8;
++            out.push((acc >> bits) as u8);
++        }
++    }
++
++    Some(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn round_trips() {
++        for s in ["", "f", "fo", "foo", "foob", "fooba", "foobar", "héllo 🌍"] {
++            let enc = encode(s.as_bytes());
++            assert_eq!(decode(enc.as_bytes()).unwrap(), s.as_bytes());
++        }
++    }
++
++    #[test]
++    fn known_vectors() {
++        assert_eq!(encode(b"foobar"), "Zm9vYmFy");
++        assert_eq!(decode(b"Zm9vYmFy").unwrap(), b"foobar");
++    }
++
++    #[test]
++    fn ignores_whitespace_and_rejects_garbage() {
++        assert_eq!(decode(b"Zm9v\nYmFy").unwrap(), b"foobar");
++        assert!(decode(b"not valid!").is_none());
 +    }
 +}

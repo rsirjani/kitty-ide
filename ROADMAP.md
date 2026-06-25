@@ -38,11 +38,15 @@ some IDE ergonomics. This project adds exactly those, and nothing more:
   (`hear` → faster-whisper transcript + spectrogram, since Claude takes no
   audio/video), **GPU** (NVIDIA RTX via container toolkit + VirtualGL, `ide-vd gl`),
   and **persistence** (`down`=stop, `reset`, `commit`) for a self-configuring box
+- [x] **Type-aware openers** — `ide-open` dispatches by file type: markdown
+  (glow), HTML (web tab), images (icat), video/audio (mpv), CSV/XLSX (VisiData),
+  docx/pptx/xlsx (LibreOffice → PDF), PDF (tdf), else nvim — with `Alt+M` / a
+  tab-bar `⇄` to morph rendered ⇄ editable (office docs edit in the VD's LibreOffice)
 
 ## Next / ideas
 
-- **More openers** — image viewer tab (kitty icat / chafa), a git status/diff
-  pane, a scratch/REPL tab, markdown preview.
+- **More openers** — a git status/diff pane, a scratch/REPL tab. (Image viewer,
+  markdown preview, and office/CSV viewers are done — see above.)
 - **carbonyl polish** — damage-based partial frame updates (scrolling currently
   re-blits the whole frame), and a configurable supersample factor.
 - **Pure-art idle screen** option (drop the hint line); maybe a few rotating

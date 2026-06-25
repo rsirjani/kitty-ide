@@ -17,7 +17,7 @@ pixel-perfect inside the terminal).
 │ ── tab bar (fixed 1 row) ────────│  shell /       │
 │                                  │  claude        │
 │   editor / reader / browser      │  session       │
-│   (nvim · tdf · carbonyl)        │                │
+│ (nvim·glow·tdf·mpv·visidata·web) │                │
 └──────────────────────────────────┴────────────────┘
 ```
 
@@ -37,9 +37,19 @@ scripts.
 - **Custom per-pane tab system** — every document (nvim, a PDF, a browser) opens
   as a tab in the editor zone. Click a tab to switch, click its `×` to close,
   click `+ web` to open a browser. Keyboard too.
+- **Opens any file in the right viewer** — one dispatcher (`ide-open`) detects
+  the type and renders it in a tab: **markdown** via [glow](https://github.com/charmbracelet/glow),
+  **HTML** in a web tab, **images** via kitty `icat`, **video/audio** via `mpv`
+  (kitty graphics), **CSV / XLSX** as editable tables in [VisiData](https://www.visidata.org/),
+  **docx / pptx / xlsx** as a crisp PDF render (LibreOffice → tdf), **PDF** via
+  tdf, everything else in nvim. Rendered tabs can **morph to editable** in place
+  (`Alt+M`, or the tab-bar `⇄`): markdown ⇄ nvim, CSV ⇄ raw, and office docs
+  open in the real LibreOffice GUI inside the Virtual Desktop.
 - **A real browser, in the terminal, crisp** — [carbonyl](https://github.com/fathyb/carbonyl)
   patched to render via the kitty graphics protocol instead of blocky
-  half-blocks (see [`carbonyl/`](carbonyl/)). Plus omnibox-style URL entry.
+  half-blocks (see [`carbonyl/`](carbonyl/)). Plus omnibox-style URL entry, and
+  **clicking any link** (e.g. one Claude prints) opens it as a browser tab in
+  that same IDE instance instead of the host's browser.
 - **Fast PDF viewing** — [tdf](https://github.com/itsjunetime/tdf), full pages,
   native scroll/zoom, kitty-graphics rendering.
 - **Fixed tab bar** — the tab strip is locked to exactly one row via a kitty
@@ -106,6 +116,7 @@ to `IgnorePkg` so the patch survives upgrades.
 **Tabs** (editor zone):
 - `Alt+]` / `Alt+[` next / previous tab · `Alt+1…9` jump to tab
 - `Alt+W` close the active tab · click a tab or its `×` · click `+ web`
+- `Alt+M` morph the active tab between rendered view and editable · click the `⇄`
 
 **Explorer** — single-click selects, **double-click activates**: opens a file as
 a tab or enters a directory (same as pressing Enter). **Right-click** copies the

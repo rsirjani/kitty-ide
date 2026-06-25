@@ -287,6 +287,117 @@ def render_ascii_image(size, t):
     return img
 
 
+# --- generated pixel-art idle loop -------------------------------------------
+# A short aurora-over-mountains video (made in OpenArt, bundled under assets/)
+# replaces the cheap ASCII scene whenever it can be decoded (PyAV). It plays as
+# a seamless ping-pong loop, nearest-neighbour scaled so the pixels stay crisp.
+# If the asset or PyAV is missing we silently fall back to render_ascii_image.
+_IDLE_ASSET = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "assets", "idle_scene", "aurora_loop.mp4")
+_idle_frames = None          # list[PIL.Image] base frames (None=unloaded, []=unavailable)
+_idle_seq = None             # ping-pong index order over _idle_frames
+
+
+def _load_idle_frames():
+    """Decode the bundled aurora loop once into RGB frames + a ping-pong order.
+    Returns [] (cached) if the asset can't be read so we fall back to ASCII."""
+    global _idle_frames, _idle_seq
+    if _idle_frames is not None:
+        return _idle_frames
+    frames = []
+    try:
+        import av
+        with av.open(_IDLE_ASSET) as container:
+            for frame in container.decode(video=0):
+                frames.append(frame.to_image().convert("RGB"))
+    except Exception:
+        frames = []
+    _idle_frames = frames
+    if frames:
+        n = len(frames)
+        # forward 0..n-1 then back n-2..1 — both endpoints visited once, so the
+        # wrap (…->1->0->1->…) is seamless even though frame 0 != frame n-1.
+        _idle_seq = list(range(n)) + list(range(n - 2, 0, -1))
+    else:
+        _idle_seq = []
+    return _idle_frames
+
+
+def _fit_idle(frame, size):
+    """Cover-fit a base frame so it FILLS the pane (no bars) — scale to the
+    larger ratio, centre-crop the overflow. Nearest-neighbour on upscale keeps
+    the pixel-art grid sharp."""
+    pw, ph = size
+    fw, fh = frame.size
+    scale = max(pw / fw, ph / fh)
+    tw, th = max(pw, round(fw * scale)), max(ph, round(fh * scale))
+    resample = Image.NEAREST if scale >= 1 else Image.LANCZOS
+    scaled = frame.resize((tw, th), resample)
+    left, top = (tw - pw) // 2, (th - ph) // 2
+    return scaled.crop((left, top, left + pw, top + ph))
+
+
+# Twinkling stars drawn into the 640x360 base frame (so they scale crisply with
+# the art). Deterministic positions in the upper sky; brightness pulses with t.
+def _gen_stars(n, w, h):
+    rnd, stars = 1234567, []
+    for _ in range(n):
+        rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; x = rnd % w
+        rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; y = rnd % int(h * 0.55)
+        rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; ph = (rnd % 628) / 100.0
+        rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; sp = 0.6 + (rnd % 100) / 100.0
+        rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; big = (rnd % 4 == 0)
+        stars.append((x, y, ph, sp, big))
+    return stars
+
+
+_STARS = _gen_stars(46, 640, 360)
+
+
+def _draw_twinkle(frame, tick):
+    import math
+    px = frame.load()
+    w, h = frame.size
+    for x, y, ph, sp, big in _STARS:
+        b = 0.5 + 0.5 * math.sin(tick * 0.22 * sp + ph)
+        if b < 0.12:
+            continue
+        v = int(170 + 85 * b)
+        col = (v, v, min(255, v + 12))
+        px[x, y] = col
+        if b > 0.55:                                  # glow into neighbours
+            d = int(60 + 70 * b)
+            dim = (d, d, min(255, d + 10))
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    px[nx, ny] = dim
+        if big and b > 0.82:                          # 4-point sparkle when bright
+            for nx, ny in ((x - 2, y), (x + 2, y), (x, y - 2), (x, y + 2)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    px[nx, ny] = (v, v, v)
+
+
+_IDLE_CAPTION = os.environ.get("IDE_VD_IDLE_CAPTION", "nothing running")
+
+
+def render_idle_image(size, tick):
+    """Idle scene for the pane: the generated pixel-art aurora loop when its
+    asset decodes, else the procedural ASCII scene."""
+    frames = _load_idle_frames()
+    if not frames:
+        return render_ascii_image(size, tick)
+    base = frames[_idle_seq[tick % len(_idle_seq)]].copy()
+    _draw_twinkle(base, tick)
+    img = _fit_idle(base, size)
+    if _IDLE_CAPTION:
+        d = ImageDraw.Draw(img)
+        f = _font(max(11, size[1] // 45))
+        tw = d.textlength(_IDLE_CAPTION, font=f)
+        d.text(((size[0] - tw) / 2, size[1] - f.size - 6), _IDLE_CAPTION,
+               font=f, fill=SUBTLE)
+    return img
+
+
 # Where to drop the frame file for kitty to read. A tmpfs (/dev/shm) keeps it
 # off disk. We reuse ONE fixed path per process (overwritten each frame) with
 # t=f (kitty does NOT delete it) — so the feed can never accumulate files. (An
@@ -492,6 +603,7 @@ async def _pull_damage(client):
 
 
 IDLE_FPS = 4.0          # the ASCII idle scene is just text; a few fps is plenty
+IDLE_VIDEO_FPS = float(os.environ.get("IDE_VD_IDLE_FPS", "12"))  # generated loop
 
 # Set by a SIGWINCH handler (registered in main) whenever the pane is resized —
 # e.g. while the user drags a split border. The paint loops wait on this instead
@@ -615,13 +727,14 @@ async def stream(host, port, password, size_ref):
 async def animate_idle(still_matches):
     """Animate the aurora placeholder (cheap local ASCII, no desktop running)
     until still_matches(resolve()) goes False — i.e. the env changes state."""
+    fps = IDLE_VIDEO_FPS if _load_idle_frames() else IDLE_FPS
     tick = 0
-    period = 1.0 / IDLE_FPS
+    period = 1.0 / fps
     while True:
-        blit(render_ascii_image(pane_pixels(), tick))
+        blit(render_idle_image(pane_pixels(), tick))
         tick += 1
         await _sleep_or_resize(period)              # wake at once on a pane resize
-        if tick % max(1, int(IDLE_FPS)) == 0:       # re-check ~once a second
+        if tick % max(1, int(fps)) == 0:            # re-check ~once a second
             if not still_matches(resolve()):
                 return
 

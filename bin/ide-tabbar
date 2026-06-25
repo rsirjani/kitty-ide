@@ -9,8 +9,23 @@ ACTIVE_FG, ACTIVE_BG = "#1e1e2e", "#89b4fa"   # blue chip for the active doc
 IDLE_FG, SEP_FG      = "#a6adc8", "#585b70"
 BTN_FG, BTN_BG       = "#1e1e2e", "#a6e3a1"   # green chip for the "+ web" button
 CLOSE_FG             = "#f38ba8"              # red "×" close glyph
+MORPH_FG             = "#f9e2af"              # yellow "⇄" rendered<->editable toggle
 
 NEW_BROWSER = "__newbrowser__"
+
+# File types that can morph between a rendered view and an editable form. Media
+# with no editable counterpart (video/audio/pdf) and plain text/code are omitted.
+MORPH_EXTS = {
+    "md","markdown","mdown","mkd","mkdn","html","htm","xhtml",
+    "png","jpg","jpeg","gif","webp","bmp","tiff","tif","ico","svg","avif",
+    "csv","tsv","xlsx","xls","ods","xlsm","docx","doc","odt","rtf","pptx","ppt","odp",
+}
+
+def morphable(file, vmode):
+    if not file or vmode not in ("view", "edit"):
+        return False
+    ext = file.rsplit(".", 1)[-1].lower() if "." in file else ""
+    return ext in MORPH_EXTS
 
 # Per-instance active-doc file, keyed off THIS IDE's control socket
 # (KITTY_LISTEN_ON = unix:/tmp/ide.sock-<pid>), so sibling IDEs never share it.
@@ -42,7 +57,8 @@ def snapshot():
             for win in t.get("windows", []):
                 v = win.get("user_vars", {})
                 if v.get("doc") == "1":
-                    docs.append((win["id"], v.get("title", "?"), bool(win.get("is_focused"))))
+                    docs.append((win["id"], v.get("title", "?"), bool(win.get("is_focused")),
+                                 v.get("vmode", ""), v.get("file", "")))
                 if v.get("pane") == "tabbar":
                     tb_dims = (win.get("lines"), win.get("columns"))
     return docs, tb_dims
@@ -60,7 +76,7 @@ def render(ds):
         msg = "  open a file from the explorer  "
         sys.stdout.write(fg(IDLE_FG) + msg + RST); col += len(msg)
     else:
-        for wid, title, foc in ds:
+        for wid, title, foc, vmode, file in ds:
             label = f" {title} "
             start = col
             if foc:
@@ -78,6 +94,14 @@ def render(ds):
                 sys.stdout.write(fg(CLOSE_FG) + cl + RST)
             col += len(cl)
             ranges.append((cstart, col, "close", wid))
+            # rendered<->editable morph button, only on the focused morphable tab.
+            # Label shows what it'll switch *to* (the opposite of the current mode).
+            if foc and morphable(file, vmode):
+                m = f"⇄ {'view' if vmode == 'edit' else 'edit'} "
+                mstart = col
+                sys.stdout.write(bg(ACTIVE_BG) + fg(MORPH_FG) + m + RST)
+                col += len(m)
+                ranges.append((mstart, col, "morph", wid))
             sys.stdout.write(fg(SEP_FG) + "│" + RST); col += 1
     # "+ web" button (ASCII so click columns stay exact); click opens carbonyl
     btn = " + web "
@@ -131,6 +155,8 @@ def main():
                         if s <= x < e:
                             if kind == "newbrowser":
                                 subprocess.Popen(["ide-open", "browser"])
+                            elif kind == "morph":
+                                subprocess.Popen(["ide-open", "toggle"])
                             elif kind == "close":
                                 close(wid)
                             else:

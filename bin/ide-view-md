@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Rendered Markdown view for the IDE editor pane.
+#
+# glow's own pager (`glow -p`) exits immediately when kitty launches it inside an
+# overlay (the TUI bails before it can take over the screen), so the tab would
+# vanish. Instead we render with glow and page the result through `less` ourselves
+# -- which reliably stays open. Press q to close the tab; Alt+M (or the tab-bar ⇄)
+# morphs to nvim for editing.
+export PATH="$HOME/.local/bin:$PATH"
+file="$1"
+[ -n "$file" ] || exit 0
+cols=$(tput cols 2>/dev/null || echo 100)
+# -s dark: match the IDE's dark theme · -w: wrap to the pane width · less -R: keep
+# glow's ANSI colours. LESS=-R also avoids a stray "missing filename" if glow fails.
+glow -s dark -w "$cols" -- "$file" 2>/dev/null | less -R

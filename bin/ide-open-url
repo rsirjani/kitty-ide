@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# kitty `open_url_with` handler for the IDE (wired up in kitty/ide.conf).
+#
+# When a URL is clicked anywhere in an IDE window -- e.g. a PR/issue link Claude
+# prints in the claude pane -- open it as a crisp carbonyl browser tab in THIS
+# instance's editor zone, instead of handing it to the host's default browser.
+#
+# kitty runs this with KITTY_LISTEN_ON pointing at the *clicking* instance's
+# control socket (boss.open_url sets it), so `ide-open browser`, which resolves
+# the instance through ide-sock and anchors the overlay to the content pane,
+# lands the tab in the right window. Non-web URLs (mailto:, file:, …) fall back
+# to the system handler.
+export PATH="$HOME/.local/bin:$PATH"
+url="$1"
+[ -n "$url" ] || exit 0
+case "$url" in
+  http://* | https://*) exec ide-open browser "$url" ;;
+  *)                     exec xdg-open "$url" ;;
+esac
