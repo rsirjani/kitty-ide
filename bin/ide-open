@@ -6,6 +6,8 @@
 #   ide-open edit    <file>   -> nvim
 #   ide-open pdf     <file>   -> tdf (fast PDF reader)
 #   ide-open browser [url]    -> carbonyl (in-terminal browser)
+#   ide-open desktop [url]    -> real Chromium in the Virtual Desktop (for OAuth/
+#                                2FA popups & passkeys that carbonyl can't render)
 #   ide-open toggle           -> morph the focused tab between rendered <-> editable
 #
 # Every document overlay carries two user vars so a tab is self-describing and
@@ -79,12 +81,27 @@ launch_overlay() {
 
 # Lowest-numbered persistent carbonyl profile not currently in use (so logins/
 # cookies survive and two tabs don't collide on Chromium's singleton lock).
+# The pool is namespaced per IDE instance so two windows never share cookies or
+# race on the same profile. Selection is serialized with flock and a short-lived
+# reservation file bridges the gap until the new carbonyl shows up in `ps`, so
+# two tabs opened in quick succession can't both grab p0 (TOCTOU).
 carbonyl_profile() {
-  local base="$HOME/.local/share/ide-carbonyl"; mkdir -p "$base"
-  local inuse n=0
+  local base="$HOME/.local/share/ide-carbonyl/${IDE_ID:-default}"; mkdir -p "$base"
+  local inuse n=0 resv now
+  exec 9>"$base/.select.lock"; flock 9 2>/dev/null || true
   inuse="$(ps -eo args 2>/dev/null | grep -oE -- "--user-data-dir=$base/p[0-9]+" | sed 's/.*=//')"
-  while printf '%s\n' "$inuse" | grep -qxF "$base/p$n"; do n=$((n + 1)); done
-  printf '%s' "$base/p$n"
+  now="$(date +%s)"
+  while :; do
+    resv="$base/p$n.resv"
+    if ! printf '%s\n' "$inuse" | grep -qxF "$base/p$n" \
+       && ! { [ -f "$resv" ] && [ "$(( now - $(stat -c %Y "$resv" 2>/dev/null || echo 0) ))" -lt 15 ]; }; then
+      : > "$resv"                       # reserve ~15s until carbonyl is in ps
+      printf '%s' "$base/p$n"
+      flock -u 9 2>/dev/null || true
+      return
+    fi
+    n=$((n + 1))
+  done
 }
 
 # Render a PDF as a tdf overlay. <filevar> lets office docs keep the ORIGINAL
@@ -167,6 +184,16 @@ do_browser() {
   launch_overlay view "" 1 "🌐 web" carbonyl --graphics --user-data-dir="$prof" "$url"
 }
 
+# Open a URL in the REAL Chromium inside the Virtual Desktop (a windowed browser
+# with a persistent profile). Use this for logins that carbonyl can't do: OAuth
+# / 2FA popups (window.open), WebAuthn / passkeys. Falls back to bringing the vd
+# pane into view so the flow is visible.
+do_desktop_browser() {
+  local url="${1:-https://accounts.google.com}"
+  ide-vd open "$url" >/dev/null 2>&1 &
+  ide-pane vd >/dev/null 2>&1 || true
+}
+
 # Open an office doc for real WYSIWYG editing in the Virtual Desktop (LibreOffice
 # GUI). Only files under the VD bind-mount (~/projects -> /work) are reachable.
 edit_in_vd() {
@@ -219,6 +246,7 @@ case "$mode" in
   edit)    [ -n "$arg" ] && do_edit "$arg" ;;
   pdf)     [ -n "$arg" ] && view_pdf "$(abspath "$arg")" "$(basename "$arg")" ;;
   browser) do_browser "$arg" ;;
+  desktop) do_desktop_browser "$arg" ;;
   toggle)  do_toggle ;;
 esac
 

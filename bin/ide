@@ -5,6 +5,18 @@
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.cache/ide-shots" "$HOME/.cache/ide-vd"
 
+# A live pid that ISN'T our kitty means the pid was recycled (Linux reuses pids),
+# so the old IDE is actually gone -- `kill -0` alone would wrongly keep its
+# orphaned container/state. Require the pid to be a live kitty.
+is_ide_kitty() { [ -r "/proc/$1/comm" ] && [ "$(cat "/proc/$1/comm" 2>/dev/null)" = kitty ]; }
+
+reap_instance() {  # drop all per-instance state + VD container(s) for a dead pid
+  local pid="$1"
+  rm -rf "/tmp/ide.sock-${pid}" "/tmp/ide-${pid}-active-doc" \
+    "/tmp/ide-${pid}-explorer-cwd" "/tmp/ide-${pid}-tabs-dirty" \
+    "/tmp/ide-${pid}-render" "/tmp/ide-${pid}-loprofile" 2>/dev/null || true
+}
+
 # Reap only *stale* control sockets (owning kitty gone) -- never a live
 # sibling's. Each IDE gets its own /tmp/ide.sock-<kitty-pid>; helper scripts
 # route through KITTY_LISTEN_ON, so instances stay self-contained. (The old
@@ -13,21 +25,16 @@ for s in /tmp/ide.sock-*; do
   [ -S "$s" ] || continue
   pid="${s##*-}"
   case "$pid" in (*[!0-9]*) continue ;; esac      # suffix isn't a pid -> leave it
-  if ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$s" "/tmp/ide-${pid}-active-doc" \
-      "/tmp/ide-${pid}-explorer-cwd" "/tmp/ide-${pid}-tabs-dirty"
-    # safety net: a window that died ungracefully (crash, sleep, power loss)
-    # leaves its VD container running -- reap it here on the next IDE launch.
-    docker rm -f "ide-vd-linux-desktop-${pid}" >/dev/null 2>&1 || true
-  fi
+  is_ide_kitty "$pid" || reap_instance "$pid"
 done
-# also reap any ide-vd container whose owning kitty pid is gone (covers envs
-# other than linux-desktop and pids with no leftover socket).
+# Reap any ide-vd container whose owning kitty pid is gone -- covers all envs
+# (not just linux-desktop) and pids with no leftover socket. Suffix-match the
+# pid exactly so e.g. "-2790" doesn't also match "-27901".
 if command -v docker >/dev/null 2>&1; then
   for c in $(docker ps -aq --filter "name=ide-vd-" 2>/dev/null); do
     n="$(docker inspect -f '{{.Name}}' "$c" 2>/dev/null)"; ipid="${n##*-}"
     case "$ipid" in (''|*[!0-9]*) continue ;; esac
-    kill -0 "$ipid" 2>/dev/null || docker rm -f "$c" >/dev/null 2>&1 || true
+    is_ide_kitty "$ipid" || docker rm -f "$c" >/dev/null 2>&1 || true
   done
 fi
 
@@ -37,7 +44,16 @@ kitty --class ide --config "$HOME/.config/kitty/ide.conf" \
   --session "$HOME/.config/kitty/ide.session" &
 kpid=$!
 # When this IDE window exits, tear down ITS virtual desktop (instance == kitty
-# pid == the socket suffix). `docker rm -f` removes the per-window container so
-# VDs don't accumulate; a sibling IDE's VD (different pid) is untouched.
-trap 'docker rm -f "ide-vd-linux-desktop-${kpid}" >/dev/null 2>&1 || true' EXIT
+# pid == the socket suffix). Reap the per-window container for ANY env (not just
+# linux-desktop) plus this instance's /tmp caches; a sibling IDE's VD (different
+# pid) is untouched.
+trap '
+  if command -v docker >/dev/null 2>&1; then
+    for c in $(docker ps -aq --filter "name=ide-vd-" 2>/dev/null); do
+      n="$(docker inspect -f "{{.Name}}" "$c" 2>/dev/null)"
+      [ "${n##*-}" = "$kpid" ] && docker rm -f "$c" >/dev/null 2>&1
+    done
+  fi
+  rm -rf "/tmp/ide-${kpid}-render" "/tmp/ide-${kpid}-loprofile" 2>/dev/null
+  true' EXIT
 wait "$kpid"

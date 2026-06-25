@@ -10,6 +10,7 @@
 #   ide-vd shot [path]
 #   ide-vd rec  <secs> [fps] [outdir]  record frames -> PNGs + montage.png
 #   ide-vd hear <secs> [outdir]        record audio -> transcript + spectrogram
+#   ide-vd speak "text" [voice] [wpm]  speak text into the virtual mic (TTS in)
 #   ide-vd click X Y [left|right|middle] | move X Y | scroll up|down [n]
 #   ide-vd type "text" | key <combo>
 #   ide-vd open <url> | run <cmd...> | launch [--gpu] <cmd...> | gl <cmd...>
@@ -32,9 +33,17 @@ instance="${KITTY_LISTEN_ON##*-}"
 case "$instance" in ''|*[!0-9A-Za-z_]*) instance="default";; esac
 export IDE_VD_INSTANCE="$instance"
 
-# Docker may not be group-active in this login yet; fall back to sudo.
-if docker info >/dev/null 2>&1; then export DOCKER="docker";
-else export DOCKER="sudo docker"; fi
+# Docker may not be group-active in this login yet; fall back to sudo. `docker
+# info` forks the daemon on every invocation, and the feed pane calls this CLI
+# ~1/s — so memoize the decision for 60s instead of probing each time.
+_docker_cache="$state/docker-cmd"
+if [ -f "$_docker_cache" ] && \
+   [ "$(( $(date +%s) - $(stat -c %Y "$_docker_cache" 2>/dev/null || echo 0) ))" -lt 60 ]; then
+  export DOCKER="$(cat "$_docker_cache")"
+else
+  if docker info >/dev/null 2>&1; then export DOCKER="docker"; else export DOCKER="sudo docker"; fi
+  echo "$DOCKER" > "$_docker_cache"
+fi
 
 die() { echo "ide-vd: $*" >&2; exit 1; }
 
@@ -155,7 +164,32 @@ case "$cmd" in
     "$venv" "$here/_ide_vd_hear.py" --wav "$wav" --outdir "$outdir"
     ;;
 
-  move|click|scroll|type|key)
+  speak)
+    # The mouth: synthesize <text> with espeak-ng and play it into the virtual
+    # microphone so the app under test hears it as mic input (getUserMedia). The
+    # input counterpart to `hear`. Self-heals the virtmic source on containers
+    # built before it shipped, so this works even without an env rebuild.
+    [ $# -ge 1 ] || die "usage: ide-vd speak <text> [voice] [wpm]"
+    e="$(need_active)"; s="$(provider_script "$e")"
+    text="$1"; voice="${2:-en-us}"; wpm="${3:-160}"
+    "$s" run "$(env_path "$e")" bash -lc '
+      pactl list short sources 2>/dev/null | grep -qw virtmic || {
+        pactl load-module module-null-sink sink_name=virtmic_sink \
+          sink_properties=device.description=VirtMicSink >/dev/null
+        pactl load-module module-remap-source master=virtmic_sink.monitor \
+          source_name=virtmic source_properties=device.description=VirtualMicrophone >/dev/null
+        pactl set-default-source virtmic >/dev/null
+      }
+      espeak-ng -v "$1" -s "$2" -w /tmp/vd-say.wav "$3" \
+        && paplay --device=virtmic_sink /tmp/vd-say.wav \
+        && echo "spoke into virtmic: $3"
+    ' _speak "$voice" "$wpm" "$text" \
+      || die "speak failed (is the env up with audio?)"
+    ;;
+
+  move|click|scroll|type|key|keydown|keyup|hold)
+    # keydown/keyup hold a key across calls; `hold <combo> [secs]` presses and
+    # releases after a delay — needed for games (plain `key` only taps).
     e="$(need_active)"
     vnc "$e" "$cmd" "$@"
     ;;
@@ -164,7 +198,8 @@ case "$cmd" in
     [ $# -ge 1 ] || die "usage: ide-vd open <url>"
     e="$(need_active)"; s="$(provider_script "$e")"
     "$s" launch "$(env_path "$e")" chromium \
-      --no-sandbox --disable-gpu --no-first-run --start-maximized "$1"
+      --no-sandbox --disable-gpu --no-first-run --start-maximized \
+      --user-data-dir=/vdshare/chromium-profile "$1"
     ;;
 
   run|launch|gl)
@@ -189,14 +224,23 @@ case "$cmd" in
     ;;
 
   _resolve)   # internal: feed the live view pane
-    e="$(active_env)"
-    if [ -z "$e" ]; then echo none; exit 0; fi
-    if ep="$(endpoint "$e" 2>/dev/null)"; then
-      host="$(echo "$ep" | cut -f1)"; port="$(echo "$ep" | cut -f2)"; pass="$(echo "$ep" | cut -f3)"
-      printf 'up\t%s\t%s\t%s\t%s\n' "$host" "$port" "$pass" "$e"
-    else
-      printf 'down\t%s\n' "$e"
+    # The feed polls this ~1/s; each miss runs `docker inspect`+`docker port`.
+    # Cache the answer for 3s so N idle panes don't storm the docker CLI.
+    cache="$state/resolve-$instance"
+    if [ -f "$cache" ] && \
+       [ "$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))" -lt 3 ]; then
+      cat "$cache"; exit 0
     fi
+    e="$(active_env)"
+    {
+      if [ -z "$e" ]; then echo none;
+      elif ep="$(endpoint "$e" 2>/dev/null)"; then
+        host="$(echo "$ep" | cut -f1)"; port="$(echo "$ep" | cut -f2)"; pass="$(echo "$ep" | cut -f3)"
+        printf 'up\t%s\t%s\t%s\t%s\n' "$host" "$port" "$pass" "$e"
+      else
+        printf 'down\t%s\n' "$e"
+      fi
+    } | tee "$cache"
     ;;
 
   help|-h|--help)
