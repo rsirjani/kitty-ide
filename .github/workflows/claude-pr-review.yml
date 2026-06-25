@@ -7,6 +7,7 @@ name: Claude Opus PR Review
 # API key. Generate it locally with `claude setup-token` and add the output as
 # the repo secret CLAUDE_CODE_OAUTH_TOKEN
 # (Settings -> Secrets and variables -> Actions -> New repository secret).
+# Until that secret is set, the review step is skipped (the job stays green).
 
 on:
   pull_request:
@@ -35,12 +36,28 @@ jobs:
       issues: write
       id-token: write
     steps:
+      # Job-level `if` can't read secrets, so gate the real work on a step that
+      # can. No token -> skip cleanly (green job) instead of a failed run + email.
+      - name: Check for Claude token
+        id: gate
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN secret not set - skipping review. Run 'claude setup-token' and add it under Settings -> Secrets -> Actions."
+          fi
+
       - name: Checkout
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history so Claude can diff against the base branch
 
       - name: Claude review
+        if: steps.gate.outputs.enabled == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
