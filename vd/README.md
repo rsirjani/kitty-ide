@@ -126,3 +126,5 @@ is bound to `127.0.0.1` only, so the desktop is never reachable off-host.
   qemu env).
 - A python venv at `~/.local/share/ide-vd/venv` with
   `asyncvnc pillow numpy faster-whisper` (created by `install.sh`).
+
+<!-- ci smoke test: verify automated Opus PR review posts -->
