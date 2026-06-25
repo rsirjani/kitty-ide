@@ -60,6 +60,8 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         uses: anthropics/claude-code-action@v1
         with:
+          # Create+update a sticky review comment and grant the posting tools.
+          track_progress: true
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Opus 4.8 - most capable model; well-suited to code review.
           claude_args: "--model claude-opus-4-8"
