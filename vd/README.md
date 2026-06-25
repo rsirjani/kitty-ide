@@ -57,6 +57,7 @@ ide-vd hear <secs> [outdir]          # sound  -> transcript.txt + spectrogram.pn
 ide-vd click X Y [left|right|middle] | move X Y | scroll up|down [n]
 ide-vd type "text" | key ctrl+s      # combos: ctrl/alt/shift/super + key
 ide-vd speak "text" [voice] [wpm]    # speak into the virtual mic (mouth; TTS in)
+ide-vd clip  <secs> [out.mp4]        # screen + mixed audio (app + mic) -> mp4
 
 # run things
 ide-vd open <url>                    # launch the desktop browser at a URL
@@ -88,6 +89,11 @@ ide-vd commit [tag]                  # snapshot the configured box to an image
   `wpm` (default `160`) tune the espeak-ng voice and rate. Example loop — answer a
   voice prompt and capture the reply: `ide-vd speak "yes, go ahead"` then
   `ide-vd hear 6` to transcribe what the app says back.
+- **Recording a voice interaction** — `clip <secs>` captures the screen plus a
+  *mix* of both audio channels (app output + the virtual mic) into one mp4, so a
+  full spoken back-and-forth is both visible and audible. It blocks for `<secs>`;
+  background it (`ide-vd clip 60 out.mp4 &`) while you drive the app with
+  `speak`/`click`/`type`. (`rec` stays video-only frames; `clip` is the A/V one.)
 
 ## GPU acceleration
 

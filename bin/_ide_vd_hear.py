@@ -94,15 +94,31 @@ def render(spec, sr, size=(1000, 400)):
     return canvas
 
 
-def transcribe(wav, model_name):
+def transcribe(x, sr, model_name):
+    """Transcribe a mono float32 signal. Robust to short/quiet clips: the VAD
+    filter silently drops those, so we peak-normalize first and fall back to a
+    no-VAD pass when the VAD pass comes back empty."""
     try:
         from faster_whisper import WhisperModel
     except Exception as e:
         return None, f"(faster-whisper unavailable: {e})"
     try:
+        audio = np.ascontiguousarray(x, dtype=np.float32)
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        if peak > 0:
+            audio = audio / peak * 0.95          # lift quiet clips into whisper's range
+        # hear records 16k mono; faster-whisper expects 16k float32 arrays
+        if sr != 16000:
+            n = max(1, round(len(audio) * 16000 / sr))
+            audio = np.interp(np.linspace(0, len(audio), n, endpoint=False),
+                              np.arange(len(audio)), audio).astype(np.float32)
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(wav, vad_filter=True)
-        text = " ".join(s.text.strip() for s in segments).strip()
+
+        def run(vad):
+            segs, _ = model.transcribe(audio, language="en", vad_filter=vad)
+            return " ".join(s.text.strip() for s in segs).strip()
+
+        text = run(True) or run(False)           # VAD-clean first, then VAD-off fallback
         return text, None
     except Exception as e:
         return None, f"(transcription failed: {e})"
@@ -124,7 +140,7 @@ def main():
     spec_path = os.path.join(args.outdir, "spectrogram.png")
     render(spec, sr).save(spec_path)
 
-    text, err = transcribe(args.wav, args.model)
+    text, err = transcribe(x, sr, args.model)
     tpath = os.path.join(args.outdir, "transcript.txt")
     with open(tpath, "w") as f:
         f.write((text or "") + "\n")
@@ -133,12 +149,18 @@ def main():
     print(f"loudness:    rms {rms:.4f}   peak_freq ~{peak_hz} Hz")
     print(f"spectrogram: {spec_path}   (Read this image to 'see' the sound)")
     print(f"transcript:  {tpath}")
+    # Distinguish the three real outcomes so the result never misleads: silence,
+    # audible-but-unintelligible (whisper choked — check the spectrogram), or speech.
+    SOUND_FLOOR = 0.005
     if err:
         print(f"speech:      {err}")
     elif text:
         print(f"speech:      “{text}”")
+    elif rms > SOUND_FLOOR:
+        print(f"speech:      (sound present — rms {rms:.4f}, peak ~{peak_hz} Hz — "
+              f"but no intelligible speech; see the spectrogram)")
     else:
-        print("speech:      (no speech detected)")
+        print(f"speech:      (silence — rms {rms:.4f} below floor {SOUND_FLOOR})")
     return 0
 
 

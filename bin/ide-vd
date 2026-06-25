@@ -11,6 +11,7 @@
 #   ide-vd rec  <secs> [fps] [outdir]  record frames -> PNGs + montage.png
 #   ide-vd hear <secs> [outdir]        record audio -> transcript + spectrogram
 #   ide-vd speak "text" [voice] [wpm]  speak text into the virtual mic (TTS in)
+#   ide-vd clip  <secs> [out.mp4]      screen + mixed audio (app + mic) -> mp4
 #   ide-vd click X Y [left|right|middle] | move X Y | scroll up|down [n]
 #   ide-vd type "text" | key <combo>
 #   ide-vd open <url> | run <cmd...> | launch [--gpu] <cmd...> | gl <cmd...>
@@ -185,6 +186,38 @@ case "$cmd" in
         && echo "spoke into virtmic: $3"
     ' _speak "$voice" "$wpm" "$text" \
       || die "speak failed (is the env up with audio?)"
+    ;;
+
+  clip)
+    # Screen + MIXED audio -> mp4: the AV counterpart to `rec`/`hear`, for
+    # capturing a full voice interaction. Mixes the app's output (`vdsink`, what
+    # `hear` records) AND the virtual mic (`virtmic_sink`, what `speak` feeds) so
+    # BOTH sides of a spoken conversation are audible. Blocks for <secs>; run it
+    # backgrounded if you need to drive the app (speak/click) while it records.
+    [ $# -ge 1 ] || die "usage: ide-vd clip <secs> [outfile.mp4]"
+    e="$(need_active)"; s="$(provider_script "$e")"
+    secs="$1"; out="${2:-$state/clip.mp4}"
+    share="$state/share${IDE_VD_INSTANCE:+-$IDE_VD_INSTANCE}"
+    mkdir -p "$share"
+    "$s" run "$(env_path "$e")" bash -lc '
+      pactl list short sources 2>/dev/null | grep -qw virtmic || {
+        pactl load-module module-null-sink sink_name=virtmic_sink \
+          sink_properties=device.description=VirtMicSink >/dev/null
+        pactl load-module module-remap-source master=virtmic_sink.monitor \
+          source_name=virtmic source_properties=device.description=VirtualMicrophone >/dev/null
+        pactl set-default-source virtmic >/dev/null
+      }
+      res=$(DISPLAY=:99 xdotool getdisplaygeometry 2>/dev/null | tr " " x); res=${res:-1280x800}
+      ffmpeg -y -loglevel error \
+        -f x11grab -framerate 15 -video_size "$res" -i :99 \
+        -f pulse -i vdsink.monitor -f pulse -i virtmic_sink.monitor \
+        -filter_complex "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0[a]" \
+        -map 0:v -map "[a]" \
+        -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -ar 44100 \
+        -t "$1" /vdshare/clip.mp4
+    ' _clip "$secs" || die "clip capture failed (is the env up with audio?)"
+    [ -s "$share/clip.mp4" ] && cp "$share/clip.mp4" "$out"
+    echo "$out"
     ;;
 
   move|click|scroll|type|key|keydown|keyup|hold)
