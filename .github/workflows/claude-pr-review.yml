@@ -1,0 +1,83 @@
+name: Claude Opus PR Review
+
+# Automated code review by Claude Opus on every pull request, plus on-demand
+# review when someone comments "@claude" on a PR or issue.
+#
+# Auth: uses a Claude subscription OAuth token (Pro/Max), NOT a pay-per-token
+# API key. Generate it locally with `claude setup-token` and add the output as
+# the repo secret CLAUDE_CODE_OAUTH_TOKEN
+# (Settings -> Secrets and variables -> Actions -> New repository secret).
+# Until that secret is set, the review step is skipped (the job stays green).
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+# Don't stack reviews: a new push cancels an in-flight review of the old commit.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Auto-review real PRs; for comment events only run when "@claude" is mentioned.
+    if: >
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      ((github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+       contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      # Job-level `if` can't read secrets, so gate the real work on a step that
+      # can. No token -> skip cleanly (green job) instead of a failed run + email.
+      - name: Check for Claude token
+        id: gate
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN secret not set - skipping review. Run 'claude setup-token' and add it under Settings -> Secrets -> Actions."
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so Claude can diff against the base branch
+
+      - name: Claude review
+        if: steps.gate.outputs.enabled == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Opus 4.8 - most capable model; well-suited to code review.
+          claude_args: "--model claude-opus-4-8"
+          prompt: |
+            You are reviewing a pull request for the kitty-ide project (a single-window
+            terminal IDE built on kitty, with a Docker-based Virtual Desktop, a carbonyl
+            in-terminal browser, and per-instance process isolation).
+
+            Review the diff in this PR for:
+            - Correctness bugs and logic errors
+            - Resource/memory leaks (containers, Chromium profiles, /tmp caches, file handles)
+            - Per-instance isolation regressions (shared mounts, global state, PID-reuse races)
+            - Security issues (passwordless/0.0.0.0 binds, --no-sandbox exposure, injection)
+            - Robustness gaps (TOCTOU races, unbounded growth, dropped input)
+
+            Report every finding, including low-confidence ones, with a confidence level and
+            severity so they can be triaged downstream - do not silently filter. Leave concise
+            inline comments on the specific lines using the available GitHub review tools, then
+            post one short summary comment with the overall verdict (approve / request changes)
+            and the top issues. Skip pure style nits unless they change behavior. If the diff is
+            clean, say so briefly.
