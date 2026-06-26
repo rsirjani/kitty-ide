@@ -17,6 +17,16 @@ from PIL import Image
 BG = (30, 30, 46)                                   # Catppuccin Mocha base
 SHM = f"/dev/shm/ide-imgview-{os.getpid()}.png"
 
+def sweep_stale_shm():
+    """Remove scratch PNGs left by viewers killed via SIGHUP/SIGTERM (closing the
+    tab skips the `finally` cleanup), so /dev/shm doesn't accumulate them."""
+    import glob
+    for p in glob.glob("/dev/shm/ide-imgview-*.png"):
+        m = re.search(r"-(\d+)\.png(?:\.tmp)?$", p)
+        if m and not os.path.exists(f"/proc/{m.group(1)}"):
+            try: os.remove(p)
+            except OSError: pass
+
 def load(path):
     im = Image.open(path)
     if im.mode in ("RGBA", "LA", "P"):
@@ -179,6 +189,15 @@ class Viewer:
         fd = 0
         old = termios.tcgetattr(fd); tty.setcbreak(fd)
         sys.stdout.write("\033[?25l\033[?1000;1002;1006h"); sys.stdout.flush()
+        # Closing the tab sends SIGHUP/SIGTERM, which skip `finally` — clean the
+        # scratch file before exiting so it doesn't leak on /dev/shm.
+        def _bye(*_):
+            try: os.remove(SHM)
+            except OSError: pass
+            os._exit(0)
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            try: signal.signal(_sig, _bye)
+            except (ValueError, OSError): pass
         signal.signal(signal.SIGWINCH, self.render)
         self.render()
         buf = ""
@@ -206,6 +225,7 @@ class Viewer:
 def main():
     if len(sys.argv) < 2:
         return
+    sweep_stale_shm()
     try:
         Viewer(sys.argv[1]).run()
     except KeyboardInterrupt:
