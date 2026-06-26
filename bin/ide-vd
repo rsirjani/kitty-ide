@@ -127,7 +127,7 @@ case "$cmd" in
     if ep="$(endpoint "$e" 2>/dev/null)"; then
       echo "endpoint: $(echo "$ep" | cut -f1,2 | tr '\t' ':')"
     fi
-    echo "fps:      ${IDE_VD_FPS:-5}"
+    echo "fps:      ${IDE_VD_FPS:-30}"   # matches ide_vd_view.py's default
     ;;
 
   shot)

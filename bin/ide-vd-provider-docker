@@ -14,10 +14,13 @@ set -euo pipefail
 action="${1:?up|down|destroy|commit|status|endpoint|run|launch}"; envfile="${2:?envfile}"; shift 2 || true
 # shellcheck disable=SC1090
 # `mount` is the host dir bind-mounted to /work. It is SHARED across all IDE
-# instances by design (one workspace), but can be made per-instance by setting
-# IDE_VD_MOUNT (e.g. to a per-window worktree) or `mount=` in the env file.
-provider=docker image=ide-vd-linux geometry=1280x800 vncport=5901 mount="${IDE_VD_MOUNT:-$HOME/projects}" gpu=none
+# instances by design (one workspace).
+provider=docker image=ide-vd-linux geometry=1280x800 vncport=5901 mount="$HOME/projects" gpu=none
 source "$envfile"
+# Per-window override: IDE_VD_MOUNT wins over the env file's mount= (e.g. point a
+# window at its own worktree), falling back to whatever the env set. Applied
+# AFTER source so the env can't clobber it (the default env hardcodes mount=).
+mount="${IDE_VD_MOUNT:-$mount}"
 
 DOCKER="${DOCKER:-docker}"
 # IDE_VD_INSTANCE (set by the ide-vd CLI from the kitty socket) makes the
