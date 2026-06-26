@@ -9,6 +9,8 @@ link() { mkdir -p "$(dirname "$2")"; ln -sfn "$1" "$2"; printf '  %s -> %s\n' "$
 
 echo "==> scripts -> ~/.local/bin"
 for f in "$REPO"/bin/*; do
+  [ -f "$f" ] || continue                 # skip data dirs (assets/, tools/, __pycache__/)
+  case "$(basename "$f")" in *.pyc) continue ;; esac
   chmod +x "$f"
   link "$f" "$HOME/.local/bin/$(basename "$f")"
 done

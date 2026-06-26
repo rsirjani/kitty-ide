@@ -13,17 +13,34 @@ action="${1:?}"; envfile="${2:?}"; shift 2 || true
 provider=qemu disk= iso= memory=4096 cpus=2 vncport=5902 accel=kvm
 source "$envfile"
 
-name="ide-vd-$(basename "$envfile" .env)"
+# Per-window isolation: suffix the VM name + pidfile with IDE_VD_INSTANCE (the
+# kitty pid), like the docker provider, so two IDE windows don't drive the same
+# VM. The VNC port is allocated dynamically (free_port) instead of a fixed one,
+# and remembered in a portfile so endpoint/status report the right port.
+inst="${IDE_VD_INSTANCE:-}"
+name="ide-vd-$(basename "$envfile" .env)${inst:+-$inst}"
 pidfile="$HOME/.cache/ide-vd/$name.pid"
-display=$(( vncport - 5900 ))
+portfile="$pidfile.port"
 
 alive() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+cur_port() { cat "$portfile" 2>/dev/null || echo "$vncport"; }
+free_port() {            # first free TCP port at/after $1 (per-window VMs differ)
+  local p="$1" i
+  for i in $(seq 0 64); do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then echo "$p"; return 0; fi
+    exec 3>&- 3<&- 2>/dev/null; p=$((p + 1))
+  done
+  echo "$1"
+}
 
 case "$action" in
   up)
     alive && exit 0
     command -v qemu-system-x86_64 >/dev/null || { echo "qemu: install qemu-system-x86_64" >&2; exit 1; }
     [ -n "$disk" ] && [ -f "$disk" ] || { echo "qemu: env 'disk=' must point at a VM image" >&2; exit 1; }
+    mkdir -p "$(dirname "$pidfile")"
+    port="$(free_port "$vncport")"; echo "$port" > "$portfile"
+    display=$(( port - 5900 ))
     args=(qemu-system-x86_64 -name "$name" -m "$memory" -smp "$cpus"
           -drive file="$disk",if=virtio
           -vnc "127.0.0.1:${display}" -usbdevice tablet)   # tablet => absolute mouse
@@ -32,15 +49,15 @@ case "$action" in
     "${args[@]}" >/dev/null 2>&1 &
     echo $! > "$pidfile"
     for _ in $(seq 1 150); do
-      if (exec 3<>"/dev/tcp/127.0.0.1/${vncport}") 2>/dev/null; then exec 3>&- 3<&-; exit 0; fi
+      if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then exec 3>&- 3<&-; exit 0; fi
       sleep 0.2
     done
-    echo "qemu: VNC port ${vncport} never came up" >&2; exit 1
+    echo "qemu: VNC port ${port} never came up" >&2; exit 1
     ;;
 
   down)
     alive && kill "$(cat "$pidfile")" 2>/dev/null || true
-    rm -f "$pidfile"
+    rm -f "$pidfile" "$portfile"
     ;;
 
   status)
@@ -48,7 +65,7 @@ case "$action" in
     ;;
 
   endpoint)
-    alive && printf '127.0.0.1\t%s\t\n' "$vncport"
+    alive && printf '127.0.0.1\t%s\t\n' "$(cur_port)"
     ;;
 
   run)

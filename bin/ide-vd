@@ -155,14 +155,19 @@ case "$cmd" in
     [ $# -ge 1 ] || die "usage: ide-vd hear <secs> [outdir]"
     e="$(need_active)"; s="$(provider_script "$e")"
     secs="$1"; outdir="${2:-$state/hear}"
-    mkdir -p "$state/share" "$outdir"
+    # Use the per-instance share dir (matches what the container's /vdshare maps
+    # to) and a unique filename so concurrent hear/clip calls don't clobber.
+    share="$state/share${IDE_VD_INSTANCE:+-$IDE_VD_INSTANCE}"
+    mkdir -p "$share" "$outdir"
+    tok="$$"
     "$s" run "$(env_path "$e")" ffmpeg -y -loglevel error \
-      -f pulse -i vdsink.monitor -t "$secs" -ac 1 -ar 16000 /vdshare/hear.wav \
+      -f pulse -i vdsink.monitor -t "$secs" -ac 1 -ar 16000 "/vdshare/hear-$tok.wav" \
       || die "audio capture failed (is the env up with audio?)"
-    wav="$state/share/hear.wav"
+    wav="$share/hear-$tok.wav"
     [ -s "$wav" ] || die "no audio captured"
     [ -x "$venv" ] || die "python venv missing (see install.sh)"
     "$venv" "$here/_ide_vd_hear.py" --wav "$wav" --outdir "$outdir"
+    rm -f "$wav"
     ;;
 
   speak)
