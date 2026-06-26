@@ -39,6 +39,12 @@ case "$action" in
     command -v qemu-system-x86_64 >/dev/null || { echo "qemu: install qemu-system-x86_64" >&2; exit 1; }
     [ -n "$disk" ] && [ -f "$disk" ] || { echo "qemu: env 'disk=' must point at a VM image" >&2; exit 1; }
     mkdir -p "$(dirname "$pidfile")"
+    # Serialize port selection + launch across concurrent `up`s (any env/window):
+    # hold the lock until this VM has bound its port — success exits the script
+    # and releases it — so a racing `up` then sees this port in use and picks the
+    # next free one instead of colliding. fd 9 closes on exit.
+    exec 9>"$(dirname "$pidfile")/.qemu-up.lock"; flock 9
+    alive && exit 0                 # a racing up already started this VM
     port="$(free_port "$vncport")"; echo "$port" > "$portfile"
     display=$(( port - 5900 ))
     args=(qemu-system-x86_64 -name "$name" -m "$memory" -smp "$cpus"

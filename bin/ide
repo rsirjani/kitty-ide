@@ -60,6 +60,8 @@ if [ -d "$vd_cache" ]; then
   for pf in "$vd_cache"/ide-vd-*.pid; do
     [ -f "$pf" ] || continue
     opid="$(basename "$pf" .pid)"; opid="${opid##*-}"
+    # Non-numeric suffix (e.g. a VM started outside the IDE -> "...-default") has
+    # no owning kitty pid to test, so leave it — same policy as the docker reaper.
     case "$opid" in (''|*[!0-9]*) continue ;; esac
     if ! is_ide_kitty "$opid"; then
       kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
