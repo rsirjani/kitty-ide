@@ -181,9 +181,11 @@ case "$cmd" in
           source_name=virtmic source_properties=device.description=VirtualMicrophone >/dev/null
         pactl set-default-source virtmic >/dev/null
       }
-      espeak-ng -v "$1" -s "$2" -w /tmp/vd-say.wav "$3" \
-        && paplay --device=virtmic_sink /tmp/vd-say.wav \
+      f="$(mktemp --suffix=.wav)"
+      espeak-ng -v "$1" -s "$2" -w "$f" "$3" \
+        && paplay --device=virtmic_sink "$f" \
         && echo "spoke into virtmic: $3"
+      st=$?; rm -f "$f"; exit $st
     ' _speak "$voice" "$wpm" "$text" \
       || die "speak failed (is the env up with audio?)"
     ;;
@@ -199,6 +201,7 @@ case "$cmd" in
     secs="$1"; out="${2:-$state/clip.mp4}"
     share="$state/share${IDE_VD_INSTANCE:+-$IDE_VD_INSTANCE}"
     mkdir -p "$share"
+    tok="$$"   # unique per call so concurrent clips don't clobber each other
     "$s" run "$(env_path "$e")" bash -lc '
       pactl list short sources 2>/dev/null | grep -qw virtmic || {
         pactl load-module module-null-sink sink_name=virtmic_sink \
@@ -214,9 +217,9 @@ case "$cmd" in
         -filter_complex "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0[a]" \
         -map 0:v -map "[a]" \
         -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -ar 44100 \
-        -t "$1" /vdshare/clip.mp4
-    ' _clip "$secs" || die "clip capture failed (is the env up with audio?)"
-    [ -s "$share/clip.mp4" ] && cp "$share/clip.mp4" "$out"
+        -t "$1" "/vdshare/clip-$2.mp4"
+    ' _clip "$secs" "$tok" || die "clip capture failed (is the env up with audio?)"
+    [ -s "$share/clip-$tok.mp4" ] && { cp "$share/clip-$tok.mp4" "$out"; rm -f "$share/clip-$tok.mp4"; }
     echo "$out"
     ;;
 
@@ -265,6 +268,8 @@ case "$cmd" in
       cat "$cache"; exit 0
     fi
     e="$(active_env)"
+    # The cached line carries the VNC password, so create it 0600 (umask 077).
+    ( umask 077; : > "$cache" )
     {
       if [ -z "$e" ]; then echo none;
       elif ep="$(endpoint "$e" 2>/dev/null)"; then

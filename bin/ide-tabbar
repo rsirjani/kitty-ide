@@ -3,7 +3,12 @@
 # highlights the focused one, switches to a tab on click, and closes one via its
 # "×". Runs in the thin "tabbar" pane on top of the editor column, and keeps
 # itself pinned to a single row so it stays fixed-height as the editor resizes.
-import sys, os, json, subprocess, select, re, signal
+import sys, os, json, subprocess, select, re, signal, unicodedata
+
+def _cw(s):
+    """Display width in terminal cells (wide/fullwidth glyphs — CJK, most emoji
+    like 🌐 — count as 2), so click ranges and truncation track real columns."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
 
 ACTIVE_FG, ACTIVE_BG = "#1e1e2e", "#89b4fa"   # blue chip for the active doc
 IDLE_FG, SEP_FG      = "#a6adc8", "#585b70"
@@ -90,7 +95,7 @@ def render(ds, cols=None):
         if foc and morphable(file, vmode):
             segs.append((f"⇄ {'view' if vmode == 'edit' else 'edit'} ", "morph", wid))
         segs.append(("│", "sep", None))
-        tabs.append({"segs": segs, "w": sum(len(s[0]) for s in segs), "foc": foc})
+        tabs.append({"segs": segs, "w": sum(_cw(s[0]) for s in segs), "foc": foc})
 
     ranges, col = [], 1
     if not tabs:
@@ -122,7 +127,7 @@ def render(ds, cols=None):
                     sys.stdout.write(bg(ACTIVE_BG) + fg(MORPH_FG) + text + RST)
                 else:
                     sys.stdout.write(fg(SEP_FG) + text + RST)
-                col += len(text)
+                col += _cw(text)
                 if kind in ("focus", "close", "morph"):
                     ranges.append((start, col, kind, wid))
         if hi < len(tabs):

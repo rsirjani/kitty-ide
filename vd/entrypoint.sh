@@ -94,6 +94,9 @@ auth_args="-nopw"
 if x11vnc -storepasswd "$(cat /vdshare/.vncpass)" /tmp/.vncpasswd >/dev/null 2>&1 \
    && [ -s /tmp/.vncpasswd ]; then
   auth_args="-rfbauth /tmp/.vncpasswd"
+else
+  echo "entrypoint: WARNING: x11vnc -storepasswd failed; serving WITHOUT a VNC" \
+       "password (relying on the 127.0.0.1 host port binding only)" >&2
 fi
 
 # x11vnc serves the live display. It must -listen on 0.0.0.0 *inside* the

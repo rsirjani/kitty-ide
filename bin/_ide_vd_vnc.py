@@ -107,6 +107,9 @@ async def run(args) -> int:
         elif cmd == "hold":
             # Press a combo, hold for <secs> (default 1.0), then release — within
             # ONE connection, so the keys stay down (games etc). `key` only taps.
+            if not args.rest:
+                print("usage: hold <combo> [secs]", file=sys.stderr)
+                return 2
             keys = [resolve_key(t) for t in args.rest[0].replace("-", "+").split("+") if t]
             secs = float(args.rest[1]) if len(args.rest) > 1 else 1.0
             with client.keyboard.hold(*keys):
@@ -118,10 +121,18 @@ async def run(args) -> int:
             # Raw key-down / key-up events. Best-effort: x11vnc releases held keys
             # when a client disconnects, so a keydown in one process won't survive
             # into a separate keyup process — use `hold` for a reliable hold.
+            if not args.rest:
+                print(f"usage: {cmd} <combo>", file=sys.stderr)
+                return 2
             keys = [resolve_key(t) for t in args.rest[0].replace("-", "+").split("+") if t]
             prefix = b"\x04\x01\x00\x00" if cmd == "keydown" else b"\x04\x00\x00\x00"
-            for k in keys:
-                client.keyboard.writer.write(prefix + asyncvnc.key_codes[k].to_bytes(4, "big"))
+            try:
+                codes = [asyncvnc.key_codes[k] for k in keys]
+            except KeyError as e:
+                print(f"unknown key: {e}", file=sys.stderr)
+                return 2
+            for c in codes:
+                client.keyboard.writer.write(prefix + c.to_bytes(4, "big"))
             await client.drain()
 
         else:

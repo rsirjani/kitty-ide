@@ -14,7 +14,8 @@ reap_instance() {  # drop all per-instance state + VD container(s) for a dead pi
   local pid="$1"
   rm -rf "/tmp/ide.sock-${pid}" "/tmp/ide-${pid}-active-doc" \
     "/tmp/ide-${pid}-explorer-cwd" "/tmp/ide-${pid}-tabs-dirty" \
-    "/tmp/ide-${pid}-render" "/tmp/ide-${pid}-loprofile" 2>/dev/null || true
+    "/tmp/ide-${pid}-render" "/tmp/ide-${pid}-loprofile" \
+    "$HOME/.local/share/ide-carbonyl/${pid}" 2>/dev/null || true
 }
 
 # Reap only *stale* control sockets (owning kitty gone) -- never a live
@@ -37,6 +38,19 @@ if command -v docker >/dev/null 2>&1; then
     is_ide_kitty "$ipid" || docker rm -f "$c" >/dev/null 2>&1 || true
   done
 fi
+# Reap carbonyl profile pools owned by dead IDEs. IDE_ID is the kitty pid, so a
+# new launch never reuses a dead pid's namespace -- without this the per-pid
+# dirs accumulate forever (a profile tree per launch). Live instances' logins
+# are kept; only dead-pid namespaces (crash/power-loss leftovers) are dropped.
+cb_base="$HOME/.local/share/ide-carbonyl"
+if [ -d "$cb_base" ]; then
+  for d in "$cb_base"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    case "$n" in (''|*[!0-9]*) continue ;; esac
+    is_ide_kitty "$n" || rm -rf "$d" 2>/dev/null || true
+  done
+fi
 
 kitty --class ide --config "$HOME/.config/kitty/ide.conf" \
   -o allow_remote_control=yes -o listen_on=unix:/tmp/ide.sock \
@@ -54,6 +68,7 @@ trap '
       [ "${n##*-}" = "$kpid" ] && docker rm -f "$c" >/dev/null 2>&1
     done
   fi
-  rm -rf "/tmp/ide-${kpid}-render" "/tmp/ide-${kpid}-loprofile" 2>/dev/null
+  rm -rf "/tmp/ide-${kpid}-render" "/tmp/ide-${kpid}-loprofile" \
+    "$HOME/.local/share/ide-carbonyl/${kpid}" 2>/dev/null
   true' EXIT
 wait "$kpid"
