@@ -228,6 +228,7 @@ def main() -> int:
                 src = f.read()
         except OSError as e:
             print(f"kitty-ide patch: cannot read {target}: {e}", file=sys.stderr)
+            rc = 1
             continue
 
         changed = False
@@ -238,6 +239,7 @@ def main() -> int:
                 print(f"kitty-ide patch: anchor for {marker} not found in "
                       f"{target}, kitty source changed; skipping.",
                       file=sys.stderr)
+                rc = 1   # real drift (not already-applied) -> surface a failure
                 continue
             src = src.replace(anchor, replacement, 1)
             changed = True
@@ -250,6 +252,7 @@ def main() -> int:
                 f.write(src)
         except OSError as e:
             print(f"kitty-ide patch: cannot write {target}: {e}", file=sys.stderr)
+            rc = 1
             continue
 
         shutil.rmtree(_PYCACHE.get(target, ""), ignore_errors=True)

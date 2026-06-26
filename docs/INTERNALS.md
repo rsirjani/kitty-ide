@@ -185,13 +185,15 @@ arXiv.
 
 carbonyl is Chromium, so two tabs sharing one profile would hit Chromium's
 singleton lock — the second refuses to open while the first is up. `ide-open`
-therefore hands each tab its own `--user-data-dir` from a **persistent pool**
-under `~/.local/share/ide-carbonyl/p<N>`: it reuses the lowest-numbered profile
-not currently held by a running carbonyl, creating it on first use. So with one
-tab open at a time you always land on `p0` and the browser stays logged in
-across sessions (cookies/history persist); extra *concurrent* tabs spill into
-`p1`, `p2`, … (each persistent in its own right). The pool lives under
-`~/.local/share` (not `/tmp`) so it survives reboots.
+therefore hands each tab its own `--user-data-dir` from a **per-instance
+persistent pool** under `~/.local/share/ide-carbonyl/<IDE_ID>/p<N>` (namespaced
+by instance, so two IDE windows don't share cookies or race on one profile): it
+claims the lowest-numbered profile not held by a running carbonyl, serialized
+with `flock` plus a short reservation file so two tabs opened at once can't both
+grab `p0` (a TOCTOU fix). With one tab open at a time you always land on `p0` and
+the browser stays logged in across sessions; extra *concurrent* tabs spill into
+`p1`, `p2`, …. The pool lives under `~/.local/share` (not `/tmp`) so it survives
+reboots, and `ide` reaps a dead instance's pool on the next launch and on exit.
 
 **Clicking a link** (e.g. a PR/issue URL Claude prints in the claude pane) opens
 it as a browser tab in that same IDE instance, rather than the host's default
@@ -203,11 +205,12 @@ back to `xdg-open`.
 
 ## PDFs
 
-`ide-open pdf <file>` opens the file in `tdf` as an overlay tab. tdf starts in
-fit-to-screen mode, which renders pages too small to read; its `z` key toggles
-fill-screen ("zoom") mode. `ide-open` auto-sends a single `z` (after a short
-delay so tdf's kitty-graphics startup handshake doesn't swallow it) so PDFs open
-readable. `z` is a toggle, so it's sent exactly once.
+`ide-open pdf <file>` opens the file in `tdf` as an overlay tab, launched with
+`tdf -f -p 4`: `-f` fullscreens the page (hides chrome, uses the whole pane) so
+it opens readable, and `-p 4` limits prerendering to nearby pages so large PDFs
+open fast and use little RAM (tdf's default prerenders the entire document).
+Office docs (docx/pptx/xlsx) are converted to PDF once via headless LibreOffice
+(cached by name+mtime) and shown the same way.
 
 ## Multiple instances (per-instance isolation)
 
@@ -251,20 +254,27 @@ work can be *seen*, not just logged. Full subsystem docs are in
   (`a=T,f=100`) at cursor-home so each frame replaces the last with no scroll. It
   reconnects on drop and shows an idle/connecting card when no env is up, so the
   IDE boots fine with Docker stopped.
-- **Eyes & hands are stateless.** Unlike the feed, `shot`/`click`/`type`/`key`
-  each make a short one-off VNC connection via `_ide_vd_vnc.py` (x11vnc is run
-  `-shared`, so they coexist with the live feed). No daemon, no FIFO, no shared
-  mutable state — every command is independent. `key` parses combos like
-  `ctrl+shift+s` into X keysym names; `click` moves then presses after a short
-  settle.
+- **Eyes & hands are stateless.** Unlike the feed,
+  `shot`/`click`/`type`/`key`/`hold`/`keydown`/`keyup` each make a short one-off
+  VNC connection via `_ide_vd_vnc.py` (x11vnc is run `-shared`, so they coexist
+  with the live feed). No daemon, no FIFO, no shared mutable state — every command
+  is independent. `key` parses combos like `ctrl+shift+s` into X keysym names and
+  taps them; `hold <combo> [secs]` presses and holds within one connection (for
+  games, where a tap isn't enough). `click` moves then presses after a short
+  settle. A *voice* side runs over the container's PulseAudio rather than VNC:
+  `speak` synthesizes text into a virtual microphone the app hears, and `clip`
+  records screen + mixed audio to mp4 (the AV counterpart to `rec`/`hear`).
 - **The docker desktop.** `vd/Dockerfile` builds Xvfb + openbox + x11vnc +
   xdotool + chromium + node/python on Debian. `entrypoint.sh` starts Xvfb `:99`,
   paints the root Catppuccin base, runs openbox, then `exec`s x11vnc as PID 1
   (so `docker stop` is clean). x11vnc uses `-nocursorshape` so the pointer is
   drawn **into** the framebuffer and therefore shows up in screenshots/feed. The
-  port is published to `127.0.0.1` only — the desktop is never reachable
-  off-host, and Claude's input lands only inside the container, never on the host
-  Hyprland session.
+  port is published to `127.0.0.1` only, **and** x11vnc serves with a generated
+  per-container VNC password (`-rfbauth`; the plaintext is written to
+  `/vdshare/.vncpass` and handed to clients via the provider endpoint) as
+  defense-in-depth, so a misconfigured port mapping can't expose a passwordless
+  desktop. Claude's input lands only inside the container, never on the host
+  Hyprland session. (The qemu/remote providers carry their own auth.)
 - **Senses beyond a still.** Claude can't ingest audio or video, so motion and
   sound are converted to text/images. `rec` (`_ide_vd_rec.py`) holds one VNC
   connection and grabs frames in a timed loop → PNGs + a `montage.png` contact
@@ -286,8 +296,10 @@ work can be *seen*, not just logged. Full subsystem docs are in
   server. Self-contained — no host audio device involved.
 - **Persistence.** `down` *stops* the container (not `rm`), so Claude's apt
   installs / config survive `up`. `reset` removes it; `commit` snapshots it to an
-  image. A `~/.cache/ide-vd/share` ↔ `/vdshare` bind-mount is how captured wavs
-  leave the container without `docker cp`.
+  image. A per-instance `~/.cache/ide-vd/share-<inst>` ↔ `/vdshare` bind-mount is
+  how captured wavs/clips leave the container without `docker cp`; the VD browser
+  also keeps a persistent `/vdshare/chromium-profile` there, so logins / "remember
+  this device" 2FA survive restarts (and `reset`).
 
 ## Known gaps
 
@@ -296,6 +308,8 @@ work can be *seen*, not just logged. Full subsystem docs are in
   not reachable from Python. Needs a kitty source patch + local build.
 - **carbonyl scrolling** re-blits the whole frame each repaint (fine for normal
   browsing; heavy for fast animations). Damage-based partial updates are a TODO.
-- **virtual-desktop FPS** — the feed likewise reblits whole frames over VNC
-  (default 5 fps, `IDE_VD_FPS`): fine for app testing and normal UI, limited for
-  fast games. Damage-based partial updates would lift it.
+- **virtual-desktop blit** — the feed pulls only changed rectangles over VNC
+  (damage-based, `_pull_damage`), but the **kitty-graphics blit** still
+  re-transmits the whole pane image each paint (`IDE_VD_FPS`, default 30): fine
+  for app testing and normal UI, limited for fast games. Partial kitty-graphics
+  updates would lift it.
