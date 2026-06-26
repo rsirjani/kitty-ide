@@ -6,22 +6,33 @@ action="${1:-next}"
 
 if [ "$action" = "close" ]; then
   # close the focused document overlay, then focus the previous tab if any
-  read -r closed nextid < <(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
+  read -r closed nextid pids < <(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
 import sys,json
-ids=[]; foc=None
+ids=[]; foc=None; fg=[]
 for w in json.load(sys.stdin):
  for t in w['tabs']:
   for win in t['windows']:
    if win.get('user_vars',{}).get('doc')=='1':
     ids.append(win['id'])
-    if win.get('is_focused'): foc=win['id']
+    if win.get('is_focused'):
+     foc=win['id']
+     fg=[str(p['pid']) for p in win.get('foreground_processes',[]) if p.get('pid')]
 if foc in ids:
  i=ids.index(foc); rest=[x for x in ids if x!=foc]
  nxt=rest[i-1] if rest else ''
- print(foc, nxt)
+ print(foc, nxt, ','.join(fg))
 ")
   if [ -n "$closed" ]; then
     kitty @ --to "$sock" close-window --match "id:$closed" >/dev/null 2>&1
+    # reap the closed window's process group(s) so a carbonyl tab's Chromium
+    # children don't linger (and keep holding their profile lock).
+    if [ -n "${pids:-}" ]; then
+      IFS=, read -ra _pids <<<"$pids"
+      for _p in "${_pids[@]}"; do
+        _pg="$(ps -o pgid= -p "$_p" 2>/dev/null | tr -d ' ')"
+        [ -n "$_pg" ] && kill -TERM -- "-$_pg" 2>/dev/null || true
+      done
+    fi
     if [ -n "$nextid" ]; then
       kitty @ --to "$sock" focus-window --match "id:$nextid" >/dev/null 2>&1
       echo "$nextid" > "$IDE_ACTIVE_DOC"

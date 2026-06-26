@@ -13,7 +13,10 @@ set -euo pipefail
 
 action="${1:?up|down|destroy|commit|status|endpoint|run|launch}"; envfile="${2:?envfile}"; shift 2 || true
 # shellcheck disable=SC1090
-provider=docker image=ide-vd-linux geometry=1280x800 vncport=5901 mount="$HOME/projects" gpu=none
+# `mount` is the host dir bind-mounted to /work. It is SHARED across all IDE
+# instances by design (one workspace), but can be made per-instance by setting
+# IDE_VD_MOUNT (e.g. to a per-window worktree) or `mount=` in the env file.
+provider=docker image=ide-vd-linux geometry=1280x800 vncport=5901 mount="${IDE_VD_MOUNT:-$HOME/projects}" gpu=none
 source "$envfile"
 
 DOCKER="${DOCKER:-docker}"
@@ -75,7 +78,10 @@ case "$action" in
     ;;
 
   endpoint)
-    is_running && { p="$(mapped_port)"; [ -n "$p" ] && printf '127.0.0.1\t%s\t\n' "$p"; }
+    # 3rd field is the VNC password the entrypoint generated (written to the
+    # shared volume). Empty until the container has written it; callers retry.
+    is_running && { p="$(mapped_port)"; [ -n "$p" ] && \
+      printf '127.0.0.1\t%s\t%s\n' "$p" "$(cat "$share/.vncpass" 2>/dev/null || true)"; }
     ;;
 
   run)      # blocking command — streams stdout (apt, glxinfo, ffmpeg, …)

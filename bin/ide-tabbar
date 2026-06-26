@@ -3,7 +3,12 @@
 # highlights the focused one, switches to a tab on click, and closes one via its
 # "×". Runs in the thin "tabbar" pane on top of the editor column, and keeps
 # itself pinned to a single row so it stays fixed-height as the editor resizes.
-import sys, os, json, subprocess, select, re
+import sys, os, json, subprocess, select, re, signal, unicodedata
+
+def _cw(s):
+    """Display width in terminal cells (wide/fullwidth glyphs — CJK, most emoji
+    like 🌐 — count as 2), so click ranges and truncation track real columns."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
 
 ACTIVE_FG, ACTIVE_BG = "#1e1e2e", "#89b4fa"   # blue chip for the active doc
 IDLE_FG, SEP_FG      = "#a6adc8", "#585b70"
@@ -69,45 +74,68 @@ def pin_one_row(tb_lines):
         kitty("resize-window", "--axis", "vertical",
               "--increment", str(1 - tb_lines), "--match", "var:pane=tabbar")
 
-def render(ds):
+def render(ds, cols=None):
+    """Draw the tab bar within `cols` columns. Long/many tabs no longer push the
+    '+ web' button off-screen or mis-map click columns: titles are truncated, the
+    visible tabs scroll to keep the focused one in view (‹/› markers), and the
+    '+ web' button is always pinned at the right and clickable."""
     sys.stdout.write("\033[H\033[2J")
+    cols = cols or 80
+    web = " + web "
+    budget = max(1, cols - len(web))        # reserve the pinned web button
+
+    def title_disp(t):
+        t = t if t is not None else "?"
+        return (t[:18] + "…") if len(t) > 19 else t
+
+    # Plan each tab's segments (with truncated title) and its total width.
+    tabs = []
+    for wid, title, foc, vmode, file in ds:
+        segs = [(f" {title_disp(title)} ", "focus", wid), ("× ", "close", wid)]
+        if foc and morphable(file, vmode):
+            segs.append((f"⇄ {'view' if vmode == 'edit' else 'edit'} ", "morph", wid))
+        segs.append(("│", "sep", None))
+        tabs.append({"segs": segs, "w": sum(_cw(s[0]) for s in segs), "foc": foc})
+
     ranges, col = [], 1
-    if not ds:
-        msg = "  open a file from the explorer  "
+    if not tabs:
+        msg = "  open a file from the explorer  "[:budget]
         sys.stdout.write(fg(IDLE_FG) + msg + RST); col += len(msg)
     else:
-        for wid, title, foc, vmode, file in ds:
-            label = f" {title} "
-            start = col
-            if foc:
-                sys.stdout.write(bg(ACTIVE_BG) + fg(ACTIVE_FG) + label + RST)
-            else:
-                sys.stdout.write(fg(IDLE_FG) + label + RST)
-            col += len(label)
-            ranges.append((start, col, "focus", wid))
-            # per-tab close button ("× ")
-            cl = "× "
-            cstart = col
-            if foc:
-                sys.stdout.write(bg(ACTIVE_BG) + fg(CLOSE_FG) + cl + RST)
-            else:
-                sys.stdout.write(fg(CLOSE_FG) + cl + RST)
-            col += len(cl)
-            ranges.append((cstart, col, "close", wid))
-            # rendered<->editable morph button, only on the focused morphable tab.
-            # Label shows what it'll switch *to* (the opposite of the current mode).
-            if foc and morphable(file, vmode):
-                m = f"⇄ {'view' if vmode == 'edit' else 'edit'} "
-                mstart = col
-                sys.stdout.write(bg(ACTIVE_BG) + fg(MORPH_FG) + m + RST)
-                col += len(m)
-                ranges.append((mstart, col, "morph", wid))
-            sys.stdout.write(fg(SEP_FG) + "│" + RST); col += 1
-    # "+ web" button (ASCII so click columns stay exact); click opens carbonyl
-    btn = " + web "
+        lo, hi = 0, len(tabs)
+        if sum(t["w"] for t in tabs) > budget:   # scroll a window around focus
+            fi = next((i for i, t in enumerate(tabs) if t["foc"]), len(tabs) - 1)
+            avail, used, lo, hi = budget - 2, tabs[fi]["w"], fi, fi + 1
+            while True:
+                grew = False
+                if hi < len(tabs) and used + tabs[hi]["w"] <= avail:
+                    used += tabs[hi]["w"]; hi += 1; grew = True
+                if lo > 0 and used + tabs[lo - 1]["w"] <= avail:
+                    lo -= 1; used += tabs[lo]["w"]; grew = True
+                if not grew:
+                    break
+        if lo > 0:
+            sys.stdout.write(fg(SEP_FG) + "‹" + RST); col += 1
+        for t in tabs[lo:hi]:
+            for text, kind, wid in t["segs"]:
+                start = col
+                if kind == "focus":
+                    sys.stdout.write((bg(ACTIVE_BG) + fg(ACTIVE_FG) if t["foc"] else fg(IDLE_FG)) + text + RST)
+                elif kind == "close":
+                    sys.stdout.write((bg(ACTIVE_BG) if t["foc"] else "") + fg(CLOSE_FG) + text + RST)
+                elif kind == "morph":
+                    sys.stdout.write(bg(ACTIVE_BG) + fg(MORPH_FG) + text + RST)
+                else:
+                    sys.stdout.write(fg(SEP_FG) + text + RST)
+                col += _cw(text)
+                if kind in ("focus", "close", "morph"):
+                    ranges.append((start, col, kind, wid))
+        if hi < len(tabs):
+            sys.stdout.write(fg(SEP_FG) + "›" + RST); col += 1
+    # "+ web" button — always pinned at the right and clickable.
     start = col
-    sys.stdout.write(bg(BTN_BG) + fg(BTN_FG) + btn + RST)
-    col += len(btn)
+    sys.stdout.write(bg(BTN_BG) + fg(BTN_FG) + web + RST)
+    col += len(web)
     ranges.append((start, col, "newbrowser", None))
     sys.stdout.flush()
     return ranges
@@ -117,8 +145,35 @@ def focus(wid):
     try: open(ACTIVE_DOC, "w").write(str(wid))   # for ide-pane "editor"
     except Exception: pass
 
+def _window_fg_pids(wid):
+    """Foreground process pids of window `wid` (the carbonyl/nvim/etc running in
+    it), so we can reap them on close — a carbonyl tab is a full Chromium whose
+    detached children otherwise linger and keep holding their profile lock."""
+    r = kitty("ls")
+    if not r or not r.stdout:
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return []
+    for w in data:
+        for t in w.get("tabs", []):
+            for win in t.get("windows", []):
+                if win.get("id") == wid:
+                    return [p["pid"] for p in win.get("foreground_processes", []) if p.get("pid")]
+    return []
+
 def close(wid):
+    pids = _window_fg_pids(wid)
     kitty("close-window", "--match", f"id:{wid}")
+    # SIGTERM the foreground process group(s): closing the kitty window alone can
+    # leave carbonyl's Chromium children orphaned (issue: web tabs not really
+    # closable + Chromium/profile leak).
+    for pid in pids:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
         if open(ACTIVE_DOC).read().strip() == str(wid):
             os.remove(ACTIVE_DOC)
@@ -143,7 +198,7 @@ def main():
             last_dims = tb_dims
             last = None                           # force a redraw (don't go blank)
         if cur != last:
-            ranges = render(cur); last = cur
+            ranges = render(cur, tb_dims[1]); last = cur
         if r:
             try: data = os.read(sys.stdin.fileno(), 4096).decode("utf-8", "replace")
             except OSError: data = ""
