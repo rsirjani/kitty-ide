@@ -268,9 +268,11 @@ case "$cmd" in
       cat "$cache"; exit 0
     fi
     e="$(active_env)"
-    # The cached line carries the VNC password, so create it 0600 (umask 077).
-    ( umask 077; : > "$cache" )
-    {
+    # Write to a 0600 temp then atomically rename into place: the cache carries
+    # the VNC password (so 0600), and the rename means a concurrent _resolve
+    # never sees a half-written / empty file (it reads the old line or the new).
+    tmp="$cache.tmp.$$"
+    ( umask 077
       if [ -z "$e" ]; then echo none;
       elif ep="$(endpoint "$e" 2>/dev/null)"; then
         host="$(echo "$ep" | cut -f1)"; port="$(echo "$ep" | cut -f2)"; pass="$(echo "$ep" | cut -f3)"
@@ -278,7 +280,9 @@ case "$cmd" in
       else
         printf 'down\t%s\n' "$e"
       fi
-    } | tee "$cache"
+    ) > "$tmp"
+    mv -f "$tmp" "$cache"
+    cat "$cache"
     ;;
 
   help|-h|--help)
