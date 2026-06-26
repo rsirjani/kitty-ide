@@ -127,8 +127,10 @@ is bound to `127.0.0.1` only, so the desktop is never reachable off-host.
 
 ## Limitations
 
-- **Frame rate** — the live feed (and `rec`) reblit whole frames: fine for UI and
-  motion, limited for fast games. Feed FPS via `IDE_VD_FPS` (default 5).
+- **Frame rate** — the live feed pulls only changed rectangles over VNC
+  (damage-based); the kitty-graphics blit still re-transmits the whole pane each
+  paint: fine for UI and motion, limited for fast games. Feed FPS via
+  `IDE_VD_FPS` (default 30).
 - **No raw audio/video to Claude** — by design: `rec`→images, `hear`→text+image.
 - **GPU is per-app** — only apps launched via `gl`/`launch --gpu` use the GPU;
   needs `nvidia-container-toolkit` (set `gpu=none` to fall back to software GL).
