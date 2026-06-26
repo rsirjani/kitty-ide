@@ -107,13 +107,15 @@ carbonyl_profile() {
 # Render a PDF as a tdf overlay. <filevar> lets office docs keep the ORIGINAL
 # path on the tab (so morph->edit reopens the source, not the cached PDF).
 view_pdf() {
-  local pdf="$1" title="$2" filevar="${3:-$1}" prog
-  if command -v tdf >/dev/null; then prog=tdf; else prog=kpdf; fi
-  launch_overlay view "$filevar" 1 "$title" "$prog" "$pdf"
-  # tdf opens fit-to-screen (tiny); its `z` key toggles fill-screen. Press it
-  # once, after a beat -- tdf swallows stdin during the kitty-graphics handshake.
-  if [ "$prog" = tdf ] && [ -n "$id" ]; then
-    ( sleep 0.5; kitty @ --to "$sock" send-text --match "id:$id" z ) >/dev/null 2>&1 &
+  local pdf="$1" title="$2" filevar="${3:-$1}"
+  if command -v tdf >/dev/null; then
+    # -f fullscreens the page (hides chrome, larger view) — replaces the old
+    # fragile "sleep 0.5 then send-text z" fill hack, so it lands instantly with
+    # no race. -p 4 prerenders only nearby pages instead of tdf's default
+    # whole-document prerender, so large PDFs open fast and use far less RAM.
+    launch_overlay view "$filevar" 1 "$title" tdf -f -p 4 "$pdf"
+  else
+    launch_overlay view "$filevar" 1 "$title" kpdf "$pdf"
   fi
 }
 
@@ -149,7 +151,11 @@ do_view() {
     image)
       launch_overlay view "$file" 1 "$title" ide-view-image "$file" ;;
     video)
-      launch_overlay view "$file" 1 "$title" mpv --vo=kitty --loop-file=no "$file" ;;
+      # hwdec=auto-copy offloads decode to the GPU and copies frames back for
+      # the kitty video output — much less CPU than software decode; it falls
+      # back to software automatically when no hwdec is available.
+      launch_overlay view "$file" 1 "$title" \
+        mpv --vo=kitty --hwdec=auto-copy --really-quiet --loop-file=no "$file" ;;
     audio)
       launch_overlay view "$file" 0 "♪ $title" mpv "$file" ;;
     pdf)

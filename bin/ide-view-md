@@ -10,6 +10,31 @@ export PATH="$HOME/.local/bin:$PATH"
 file="$1"
 [ -n "$file" ] || exit 0
 cols=$(tput cols 2>/dev/null || echo 100)
+
+# Cache glow's rendered output keyed by abspath+mtime+width, so re-opening the
+# same (unchanged) markdown is instant instead of re-rendering each time. The
+# cache lives under this instance's /tmp render dir, which `ide` cleans on exit.
+. ide-sock 2>/dev/null || true
+cache_dir="/tmp/ide-${IDE_ID:-default}-render"; mkdir -p "$cache_dir" 2>/dev/null || true
+# Split the key: a per-file hash + a per-version (mtime+width) hash, so we can
+# prune older renders of the same file before writing the new one (bounds growth
+# within a session).
+pathhash="$(printf '%s' "$(readlink -f -- "$file" 2>/dev/null || echo "$file")" | md5sum | cut -d' ' -f1)"
+verhash="$(printf '%s|%s' "$(stat -c %Y -- "$file" 2>/dev/null || echo 0)" "$cols" | md5sum | cut -d' ' -f1)"
+cache="$cache_dir/md-$pathhash-$verhash.ansi"
+
 # -s dark: match the IDE's dark theme · -w: wrap to the pane width · less -R: keep
 # glow's ANSI colours. LESS=-R also avoids a stray "missing filename" if glow fails.
-glow -s dark -w "$cols" -- "$file" 2>/dev/null | less -R
+if [ ! -s "$cache" ]; then
+  rm -f "$cache_dir/md-$pathhash-"*.ansi 2>/dev/null || true   # drop stale renders of this file
+  # Render to a temp then atomically rename, so a concurrent viewer never reads
+  # a half-written cache (and two renders of the same key can't clobber).
+  tmp="$cache.$$.tmp"
+  if glow -s dark -w "$cols" -- "$file" 2>/dev/null > "$tmp" && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$cache"
+  else
+    rm -f "$tmp"
+  fi
+fi
+if [ -s "$cache" ]; then less -R -- "$cache"
+else glow -s dark -w "$cols" -- "$file" 2>/dev/null | less -R; fi
