@@ -21,7 +21,9 @@ def sweep_stale_shm():
     """Remove scratch PNGs left by viewers killed via SIGHUP/SIGTERM (closing the
     tab skips the `finally` cleanup), so /dev/shm doesn't accumulate them."""
     import glob
-    for p in glob.glob("/dev/shm/ide-imgview-*.png"):
+    # Glob without the .png suffix so a crash-leftover ide-imgview-<pid>.png.tmp
+    # (from a mid-os.replace crash) is also reclaimable.
+    for p in glob.glob("/dev/shm/ide-imgview-*"):
         m = re.search(r"-(\d+)\.png(?:\.tmp)?$", p)
         if m and not os.path.exists(f"/proc/{m.group(1)}"):
             try: os.remove(p)
@@ -192,6 +194,14 @@ class Viewer:
         # Closing the tab sends SIGHUP/SIGTERM, which skip `finally` — clean the
         # scratch file before exiting so it doesn't leak on /dev/shm.
         def _bye(*_):
+            # Restore the terminal too, in case the TTY outlives us (normally the
+            # tab teardown destroys the window, but don't leave it in cbreak +
+            # mouse-tracking if it doesn't).
+            try: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception: pass
+            try:
+                sys.stdout.write("\033[?1000;1002;1006l\033[?25h"); sys.stdout.flush()
+            except Exception: pass
             try: os.remove(SHM)
             except OSError: pass
             os._exit(0)
