@@ -51,6 +51,24 @@ if [ -d "$cb_base" ]; then
     is_ide_kitty "$n" || rm -rf "$d" 2>/dev/null || true
   done
 fi
+# Reap qemu VDs whose owning IDE is gone. Unlike docker containers (handled
+# above), a qemu VM is tracked by ~/.cache/ide-vd/<name>.pid where <name> ends
+# in the owning kitty pid; nothing else stops it, so it would otherwise run
+# headless forever after the window closes.
+vd_cache="$HOME/.cache/ide-vd"
+if [ -d "$vd_cache" ]; then
+  for pf in "$vd_cache"/ide-vd-*.pid; do
+    [ -f "$pf" ] || continue
+    opid="$(basename "$pf" .pid)"; opid="${opid##*-}"
+    # Non-numeric suffix (e.g. a VM started outside the IDE -> "...-default") has
+    # no owning kitty pid to test, so leave it — same policy as the docker reaper.
+    case "$opid" in (''|*[!0-9]*) continue ;; esac
+    if ! is_ide_kitty "$opid"; then
+      kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+      rm -f "$pf" "$pf.port" 2>/dev/null || true
+    fi
+  done
+fi
 
 kitty --class ide --config "$HOME/.config/kitty/ide.conf" \
   -o allow_remote_control=yes -o listen_on=unix:/tmp/ide.sock \
@@ -68,6 +86,11 @@ trap '
       [ "${n##*-}" = "$kpid" ] && docker rm -f "$c" >/dev/null 2>&1
     done
   fi
+  for pf in "$HOME/.cache/ide-vd"/ide-vd-*-"${kpid}".pid; do
+    [ -f "$pf" ] || continue
+    kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$pf" "$pf.port" 2>/dev/null
+  done
   rm -rf "/tmp/ide-${kpid}-render" "/tmp/ide-${kpid}-loprofile" \
     "$HOME/.local/share/ide-carbonyl/${kpid}" 2>/dev/null
   true' EXIT

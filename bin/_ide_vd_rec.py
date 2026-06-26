@@ -21,12 +21,19 @@ import asyncvnc
 
 
 async def run(args) -> int:
+    import os
+
     from PIL import Image
 
     interval = 1.0 / args.fps
     n_target = max(1, round(args.secs * args.fps))
+    os.makedirs(args.outdir, exist_ok=True)
 
-    frames = []          # (index, PIL.Image, capture_time)
+    # Stream frames to disk as they're captured instead of holding them all in
+    # memory — a long/high-fps recording would otherwise buffer GBs of raw RGB
+    # and risk an OOM kill. Only metadata is kept; peak memory is one full frame.
+    meta = []            # (index, path, capture_time)
+    fw = fh = 0
     async with asyncvnc.connect(
         args.host, args.port, password=args.password or None
     ) as client:
@@ -39,22 +46,17 @@ async def run(args) -> int:
                 await asyncio.sleep(target - now)
             rgba = await client.screenshot()
             img = Image.fromarray(rgba, "RGBA").convert("RGB")
-            frames.append((i, img, loop.time() - t0))
+            if not fw:
+                fw, fh = img.size
+            p = os.path.join(args.outdir, f"frame_{i:04d}.png")
+            img.save(p)                      # write now; img drops out of scope
+            meta.append((i, p, loop.time() - t0))
         elapsed = loop.time() - t0
 
-    # Persist individual frames.
-    import os
-    os.makedirs(args.outdir, exist_ok=True)
-    paths = []
-    for i, img, _ in frames:
-        p = os.path.join(args.outdir, f"frame_{i:04d}.png")
-        img.save(p)
-        paths.append(p)
-
-    # Build a montage contact sheet.
+    # Build the montage by re-reading frames from disk (downscaled), so peak
+    # memory stays at one full frame + the (smaller) contact sheet.
     cols = args.montage_cols
-    rows = (len(frames) + cols - 1) // cols
-    fw, fh = frames[0][1].size
+    rows = (len(meta) + cols - 1) // cols
     scale = args.montage_width / (cols * fw)
     tw, th = max(1, int(fw * scale)), max(1, int(fh * scale))
     pad, label_h = 4, 14
@@ -65,18 +67,22 @@ async def run(args) -> int:
         draw = ImageDraw.Draw(sheet)
     except Exception:
         draw = None
-    for idx, (i, img, t) in enumerate(frames):
+    for idx, (i, p, t) in enumerate(meta):
         r, c = divmod(idx, cols)
         x = pad + c * cell_w
         y = pad + r * cell_h
-        sheet.paste(img.resize((tw, th)), (x, y + label_h))
+        try:
+            with Image.open(p) as fim:
+                sheet.paste(fim.convert("RGB").resize((tw, th)), (x, y + label_h))
+        except Exception:
+            pass
         if draw is not None:
             draw.text((x + 2, y + 2), f"#{i}  {t:4.2f}s", fill=(200, 200, 200))
     montage_path = os.path.join(args.outdir, "montage.png")
     sheet.save(montage_path)
 
-    actual_fps = (len(frames) - 1) / elapsed if elapsed > 0 and len(frames) > 1 else float(len(frames))
-    print(f"frames:      {len(frames)}")
+    actual_fps = (len(meta) - 1) / elapsed if elapsed > 0 and len(meta) > 1 else float(len(meta))
+    print(f"frames:      {len(meta)}")
     print(f"elapsed:     {elapsed:.2f}s")
     print(f"actual_fps:  {actual_fps:.2f}")
     print(f"frame_size:  {fw}x{fh}")

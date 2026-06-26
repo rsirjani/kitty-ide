@@ -155,11 +155,15 @@ case "$cmd" in
     [ $# -ge 1 ] || die "usage: ide-vd hear <secs> [outdir]"
     e="$(need_active)"; s="$(provider_script "$e")"
     secs="$1"; outdir="${2:-$state/hear}"
-    mkdir -p "$state/share" "$outdir"
+    # Use the per-instance share dir (matches what the container's /vdshare maps
+    # to) and a unique filename so concurrent hear/clip calls don't clobber.
+    share="$state/share${IDE_VD_INSTANCE:+-$IDE_VD_INSTANCE}"
+    mkdir -p "$share" "$outdir"
+    tok="$$"; wav="$share/hear-$tok.wav"
+    trap 'rm -f "$wav"' EXIT     # clean the temp on every path (set -e aborts early)
     "$s" run "$(env_path "$e")" ffmpeg -y -loglevel error \
-      -f pulse -i vdsink.monitor -t "$secs" -ac 1 -ar 16000 /vdshare/hear.wav \
+      -f pulse -i vdsink.monitor -t "$secs" -ac 1 -ar 16000 "/vdshare/hear-$tok.wav" \
       || die "audio capture failed (is the env up with audio?)"
-    wav="$state/share/hear.wav"
     [ -s "$wav" ] || die "no audio captured"
     [ -x "$venv" ] || die "python venv missing (see install.sh)"
     "$venv" "$here/_ide_vd_hear.py" --wav "$wav" --outdir "$outdir"
@@ -201,7 +205,8 @@ case "$cmd" in
     secs="$1"; out="${2:-$state/clip.mp4}"
     share="$state/share${IDE_VD_INSTANCE:+-$IDE_VD_INSTANCE}"
     mkdir -p "$share"
-    tok="$$"   # unique per call so concurrent clips don't clobber each other
+    tok="$$"; ctmp="$share/clip-$tok.mp4"   # unique per call; cleaned on every path
+    trap 'rm -f "$ctmp"' EXIT
     "$s" run "$(env_path "$e")" bash -lc '
       pactl list short sources 2>/dev/null | grep -qw virtmic || {
         pactl load-module module-null-sink sink_name=virtmic_sink \
@@ -219,7 +224,7 @@ case "$cmd" in
         -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -ar 44100 \
         -t "$1" "/vdshare/clip-$2.mp4"
     ' _clip "$secs" "$tok" || die "clip capture failed (is the env up with audio?)"
-    [ -s "$share/clip-$tok.mp4" ] && { cp "$share/clip-$tok.mp4" "$out"; rm -f "$share/clip-$tok.mp4"; }
+    [ -s "$ctmp" ] && cp "$ctmp" "$out"
     echo "$out"
     ;;
 

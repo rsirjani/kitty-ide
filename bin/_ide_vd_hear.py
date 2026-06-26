@@ -140,7 +140,16 @@ def main():
     spec_path = os.path.join(args.outdir, "spectrogram.png")
     render(spec, sr).save(spec_path)
 
-    text, err = transcribe(x, sr, args.model)
+    # Distinguish the three real outcomes so the result never misleads: silence,
+    # audible-but-unintelligible (whisper choked — check the spectrogram), or speech.
+    SOUND_FLOOR = 0.005
+    # Skip transcription on silence: loading the whisper model costs a download
+    # (first run) + seconds every call, and there's nothing to transcribe below
+    # the sound floor.
+    if rms <= SOUND_FLOOR:
+        text, err = None, None
+    else:
+        text, err = transcribe(x, sr, args.model)
     tpath = os.path.join(args.outdir, "transcript.txt")
     with open(tpath, "w") as f:
         f.write((text or "") + "\n")
@@ -149,9 +158,6 @@ def main():
     print(f"loudness:    rms {rms:.4f}   peak_freq ~{peak_hz} Hz")
     print(f"spectrogram: {spec_path}   (Read this image to 'see' the sound)")
     print(f"transcript:  {tpath}")
-    # Distinguish the three real outcomes so the result never misleads: silence,
-    # audible-but-unintelligible (whisper choked — check the spectrogram), or speech.
-    SOUND_FLOOR = 0.005
     if err:
         print(f"speech:      {err}")
     elif text:
