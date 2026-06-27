@@ -583,6 +583,10 @@ async def _pull_damage(client):
             await client.reader.readexactly(3)
             n = await read_int(client.reader, 4)
             await client.reader.readexactly(n)
+        elif mtype == 1:                        # SetColourMapEntries — consume its
+            await client.reader.readexactly(3)  # body (1 pad + 2 first-colour) so
+            ncol = await read_int(client.reader, 2)   # a palette-mode server can't
+            await client.reader.readexactly(ncol * 6)  # desync the RFB stream
         # mtype == 3 (bell) has no payload; anything else we just loop on
     await client.reader.readexactly(1)          # padding
     n_rects = await read_int(client.reader, 2)
