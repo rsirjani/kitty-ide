@@ -79,7 +79,7 @@ fi
 echo "==> kitty layout patch (needs sudo)"
 # Template the hook's hardcoded /home/tin path to THIS user's home, so the
 # post-upgrade re-apply works for anyone (not just the author's machine).
-sed "s|/home/tin|$HOME|g" "$REPO/pacman/zz-kitty-fixed-lines.hook" \
+sed "s|/home/tin/|$HOME/|g" "$REPO/pacman/zz-kitty-fixed-lines.hook" \
   | sudo tee /etc/pacman.d/hooks/zz-kitty-fixed-lines.hook >/dev/null
 sudo python3 "$REPO/kitty/patches/apply-fixed-lines-patch.py" \
   || echo "   (kitty patch did not fully apply — layout tweaks may be inactive; see kitty/patches/)"
