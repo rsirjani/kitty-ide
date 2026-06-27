@@ -10,7 +10,7 @@
 layout splits
 
 # explorer (top-left of the left column)
-launch --var pane=explorer --title explorer --cwd=/home/tin/projects bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; setsid ide-cwd-follow >/dev/null 2>&1 & YAZI_CONFIG_HOME=$HOME/.config/yazi-ide exec yazi /home/tin/projects"
+launch --var pane=explorer --title explorer --cwd=$HOME/projects bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; setsid ide-cwd-follow >/dev/null 2>&1 & YAZI_CONFIG_HOME=$HOME/.config/yazi-ide exec yazi $HOME/projects"
 
 # claude column on the right (~28% width): a thin header strip (shows the current
 # Claude chat title) on top, the claude shell below it -- like the editor's
@@ -25,7 +25,7 @@ launch --location=vsplit --bias=28 --var pane=chat-header --var fixed_lines=1 --
 # title to an AI summary of the chat via OSC, and a kitty --title would pin it
 # (title_overridden), so we leave it free for the header/Waybar to read.
 focus_matching_window var:pane=chat-header
-launch --location=hsplit --bias=97 --var pane=claude --var hlgroup=claude --cwd=/home/tin/projects sh -c 'export NO_ZELLIJ_AUTOSTART=1; exec zsh'
+launch --location=hsplit --bias=97 --var pane=claude --var hlgroup=claude --cwd=$HOME/projects sh -c 'export NO_ZELLIJ_AUTOSTART=1; exec zsh'
 
 # editor zone BELOW the top band: tab-bar strip (top band keeps ~35% height)
 focus_matching_window var:pane=explorer
