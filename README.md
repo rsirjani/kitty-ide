@@ -68,6 +68,9 @@ scripts.
   session ends the explorer returns to where it was and the mount is released.
   Auth is non-interactive — use keys, or let it ride the interactive session's
   connection via ssh multiplexing (`ControlMaster auto` in `~/.ssh/config`).
+  For ssh sessions kitty can't see (Claude Code's Bash tool runs detached from
+  the pane's tty; tmux), `ide-remote [user@]host[:port]` forces the switch and
+  `ide-remote off` brings the explorer home.
 - **A virtual desktop Claude can pilot** — an isolated graphical environment
   (Docker X11 desktop, a QEMU VM, or a remote box — all over VNC) rendered live
   in the top-left feed pane. Claude gets **eyes** (`ide-vd shot`) and **hands**

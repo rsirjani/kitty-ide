@@ -20,6 +20,7 @@ export PATH="$HOME/.local/bin:$PATH"
 sockpath="${sock#unix:}"
 MNT_BASE="/tmp/ide-${IDE_ID}-remote"
 YID_FILE="/tmp/ide-${IDE_ID}-explorer-yazi-id"
+OVR_FILE="/tmp/ide-${IDE_ID}-remote-dest"    # manual override, see ide-remote
 
 MAX_TRIES=5                  # mount attempts per ssh session
 RETRY_SECS=6                 # gap between attempts (time to enter a password)
@@ -100,6 +101,17 @@ for w in data:
 print(dest, port)
 ')"
   [ -z "$dest" ] && dest="-"
+
+  # A manual override (`ide-remote [user@]host[:port]`) beats pane detection --
+  # it covers ssh sessions kitty can't see (Claude Code's Bash tool, tmux).
+  ovr="$(cat "$OVR_FILE" 2>/dev/null)"
+  if [ -n "$ovr" ]; then
+    dest="$ovr" port="-"
+    hostpart="${ovr##*@}"
+    if [ "${hostpart#*:}" != "$hostpart" ]; then
+      port="${hostpart##*:}" dest="${ovr%:*}"
+    fi
+  fi
 
   if [ "$dest" != "$active" ]; then   # session started / ended / switched host
     if [ "$dest" = "-" ] && [ "$miss" -lt 1 ]; then
