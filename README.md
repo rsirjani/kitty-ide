@@ -62,6 +62,12 @@ scripts.
 - **Explorer-following terminal** — as you browse directories in the explorer,
   the terminal silently `cd`s to match — but only when it's idle (never typing
   into a running claude session or command).
+- **Remote-following explorer** — `ssh` (or `kitten ssh`) somewhere in the
+  claude pane and the explorer switches to the *remote* filesystem: the remote
+  home is sshfs-mounted and yazi is steered there over its DDS; when the ssh
+  session ends the explorer returns to where it was and the mount is released.
+  Auth is non-interactive — use keys, or let it ride the interactive session's
+  connection via ssh multiplexing (`ControlMaster auto` in `~/.ssh/config`).
 - **A virtual desktop Claude can pilot** — an isolated graphical environment
   (Docker X11 desktop, a QEMU VM, or a remote box — all over VNC) rendered live
   in the top-left feed pane. Claude gets **eyes** (`ide-vd shot`) and **hands**

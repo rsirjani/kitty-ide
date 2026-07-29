@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Point the IDE explorer (yazi) at the REMOTE filesystem while the claude pane
+# is SSH'd into another machine, and bring it home when the session ends.
+#
+# Loop: watch the claude pane's foreground processes via `kitty @ ls`. When one
+# of them is `ssh` (or `kitten ssh`), parse the destination from its command
+# line, sshfs-mount the remote home under /tmp/ide-<id>-remote/<dest>, and
+# steer yazi there over its DDS (`ya emit-to <id> ...` -- the instance's
+# YAZI_ID, which init.lua publishes to /tmp/ide-<id>-explorer-yazi-id). When
+# the ssh process exits, steer yazi back to wherever it was and release the
+# mount.
+#
+# sshfs runs non-interactively (BatchMode): key/agent auth only. A destination
+# that fails to mount is retried a few times (password typing, slow links),
+# then left alone for the rest of THAT ssh session. ide-cwd-follow needs no
+# special casing: while ssh runs, the claude pane is "busy", so it never
+# echoes the explorer's remote cd's back as local `cd` commands.
+export PATH="$HOME/.local/bin:$PATH"
+. ide-sock                   # -> sock, IDE_ID, IDE_CWD_FILE for THIS instance
+sockpath="${sock#unix:}"
+MNT_BASE="/tmp/ide-${IDE_ID}-remote"
+YID_FILE="/tmp/ide-${IDE_ID}-explorer-yazi-id"
+
+MAX_TRIES=5                  # mount attempts per ssh session
+RETRY_SECS=6                 # gap between attempts (time to enter a password)
+
+active="-"                   # destination of the ssh session being tracked
+mnt=""                       # its mountpoint ("" = not mounted)
+prev=""                      # explorer cwd to restore afterwards
+tries=0 next_try=0 miss=0
+
+release() {                  # cd yazi back home, then drop the mount
+  [ -z "$mnt" ] && return
+  [ -n "$1" ] && [ -d "${prev:-}" ] && ya emit-to "$1" cd "$prev" >/dev/null 2>&1
+  sleep 0.4                  # let yazi leave the mount before unmounting
+  fusermount3 -u -z "$mnt" 2>/dev/null
+  rmdir "$mnt" "$MNT_BASE" 2>/dev/null
+  mnt=""
+}
+
+while true; do
+  if [ ! -S "$sockpath" ]; then       # THIS IDE gone -> clean up and stop
+    [ -n "$mnt" ] && fusermount3 -u -z "$mnt" 2>/dev/null
+    exit 0
+  fi
+
+  yazid="$(cat "$YID_FILE" 2>/dev/null)"
+
+  # One `kitty @ ls` -> "DEST PORT"; both are "-" when the claude pane runs no
+  # ssh. The parser walks ssh(1) flags (those that eat a value) to find the
+  # destination arg, honouring -l user and -p port.
+  read -r dest port <<<"$(kitty @ --to "$sock" ls 2>/dev/null | python3 -c '
+import json, os, sys
+dest, port = "-", "-"
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+def parse_ssh(argv):
+    takes_arg = set("bBcDEeFIiJLlmOopQRSWw")
+    user = prt = tgt = None
+    i = 1
+    while i < len(argv) and tgt is None:
+        a = argv[i]
+        if a.startswith("-") and len(a) > 1:
+            f = a[1]
+            if f in takes_arg:
+                val = a[2:] or (argv[i + 1] if i + 1 < len(argv) else "")
+                if not a[2:]:
+                    i += 1
+                if f == "p": prt = val
+                if f == "l": user = val
+        else:
+            tgt = a
+        i += 1
+    if not tgt:
+        return None
+    if tgt.startswith("ssh://"):                 # ssh://[user@]host[:port]
+        tgt = tgt[6:].split("/", 1)[0]
+        if ":" in tgt.rsplit("@", 1)[-1]:
+            tgt, _, prt = tgt.rpartition(":")
+    if user and "@" not in tgt:
+        tgt = user + "@" + tgt
+    return tgt, prt or "-"
+for w in data:
+    for t in w.get("tabs", []):
+        for win in t.get("windows", []):
+            pane = win.get("user_vars", {}).get("pane")
+            for p in win.get("foreground_processes", []):
+                argv = p.get("cmdline") or [""]
+                exe = os.path.basename(argv[0]).lstrip("-")
+                if exe == "kitty" and argv[1:3] == ["+kitten", "ssh"]:
+                    exe, argv = "ssh", argv[2:]
+                if exe == "kitten" and argv[1:2] == ["ssh"]:
+                    exe, argv = "ssh", argv[1:]
+                if pane == "claude" and exe == "ssh":
+                    r = parse_ssh(argv)
+                    if r:
+                        dest, port = r
+print(dest, port)
+')"
+  [ -z "$dest" ] && dest="-"
+
+  if [ "$dest" != "$active" ]; then   # session started / ended / switched host
+    if [ "$dest" = "-" ] && [ "$miss" -lt 1 ]; then
+      miss=$((miss + 1))              # tolerate one blank `kitty @ ls` blip
+    else
+      release "$yazid"
+      active="$dest" tries=0 next_try=0 miss=0
+    fi
+  else
+    miss=0
+  fi
+
+  if [ "$active" != "-" ] && [ -z "$mnt" ] && [ -n "$yazid" ] \
+     && [ "$tries" -lt "$MAX_TRIES" ] && [ "$SECONDS" -ge "$next_try" ]; then
+    tries=$((tries + 1)) next_try=$((SECONDS + RETRY_SECS))
+    m="$MNT_BASE/${active//[^A-Za-z0-9_.@-]/_}"
+    mkdir -p "$m"
+    p=""; [ "$port" != "-" ] && p="$port"
+    if mountpoint -q "$m" || timeout 15 sshfs \
+         -o BatchMode=yes,ConnectTimeout=6,reconnect,ServerAliveInterval=15 \
+         ${p:+-p "$p"} "$active": "$m" 2>/dev/null; then
+      mnt="$m"
+      prev="$(cat "$IDE_CWD_FILE" 2>/dev/null)"; prev="${prev:-$HOME/projects}"
+      ya emit-to "$yazid" cd "$mnt" >/dev/null 2>&1
+    fi
+  fi
+
+  sleep 1
+done

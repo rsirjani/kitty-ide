@@ -2,10 +2,24 @@
 -- claude terminal can follow it (see ~/.local/bin/ide-cwd-follow). The file is
 -- keyed off THIS IDE's control socket (KITTY_LISTEN_ON = unix:/tmp/ide.sock-<pid>)
 -- so sibling IDEs on other workspaces don't clobber each other's cwd.
-local function ide_cwd_file()
+local function ide_state_file(kind)
 	local s = os.getenv("KITTY_LISTEN_ON") or ""
 	local id = s:match("ide%.sock%-(.+)$") or "default"
-	return "/tmp/ide-" .. id .. "-explorer-cwd"
+	return "/tmp/ide-" .. id .. "-explorer-" .. kind
+end
+
+local function ide_cwd_file()
+	return ide_state_file("cwd")
+end
+
+-- IDE: publish this instance's DDS id (YAZI_ID -- NOT the pid) so helpers like
+-- ide-remote-follow can steer the explorer with `ya emit-to <id> cd ...`.
+do
+	local f = io.open(ide_state_file("yazi-id"), "w")
+	if f then
+		f:write(tostring(os.getenv("YAZI_ID") or ""))
+		f:close()
+	end
 end
 
 ps.sub("cd", function()

@@ -10,7 +10,7 @@
 layout splits
 
 # explorer (top-left of the left column)
-launch --var pane=explorer --title explorer --cwd=$HOME/projects bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; setsid ide-cwd-follow >/dev/null 2>&1 & YAZI_CONFIG_HOME=$HOME/.config/yazi-ide exec yazi $HOME/projects"
+launch --var pane=explorer --title explorer --cwd=$HOME/projects bash -lc "export PATH=\"$HOME/.local/bin:\$PATH\"; setsid ide-cwd-follow >/dev/null 2>&1 & setsid ide-remote-follow >/dev/null 2>&1 & YAZI_CONFIG_HOME=$HOME/.config/yazi-ide exec yazi $HOME/projects"
 
 # claude column on the right (~28% width): a thin header strip (shows the current
 # Claude chat title) on top, the claude shell below it -- like the editor's
