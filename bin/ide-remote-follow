@@ -20,7 +20,8 @@ export PATH="$HOME/.local/bin:$PATH"
 sockpath="${sock#unix:}"
 MNT_BASE="/tmp/ide-${IDE_ID}-remote"
 YID_FILE="/tmp/ide-${IDE_ID}-explorer-yazi-id"
-OVR_FILE="/tmp/ide-${IDE_ID}-remote-dest"    # manual override, see ide-remote
+OVR_FILE="/tmp/ide-${IDE_ID}-remote-dest"        # manual override, see ide-remote
+AUTO_FILE="/tmp/ide-${IDE_ID}-remote-dest-auto"  # hook-refreshed, TTL-expired
 
 MAX_TRIES=5                  # mount attempts per ssh session
 RETRY_SECS=6                 # gap between attempts (time to enter a password)
@@ -104,7 +105,17 @@ print(dest, port)
 
   # A manual override (`ide-remote [user@]host[:port]`) beats pane detection --
   # it covers ssh sessions kitty can't see (Claude Code's Bash tool, tmux).
+  # The auto override (refreshed by ide-remote-hook on every ssh Claude runs)
+  # ranks below manual and lapses IDE_REMOTE_TTL secs after its last refresh,
+  # so the explorer drifts home once Claude stops touching the remote.
   ovr="$(cat "$OVR_FILE" 2>/dev/null)"
+  if [ -z "$ovr" ] && [ -f "$AUTO_FILE" ]; then
+    if [ "$(( $(date +%s) - $(stat -c %Y "$AUTO_FILE" 2>/dev/null || echo 0) ))" -lt "${IDE_REMOTE_TTL:-900}" ]; then
+      ovr="$(cat "$AUTO_FILE" 2>/dev/null)"
+    else
+      rm -f "$AUTO_FILE"
+    fi
+  fi
   if [ -n "$ovr" ]; then
     dest="$ovr" port="-"
     hostpart="${ovr##*@}"

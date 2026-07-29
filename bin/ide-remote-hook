@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Claude Code PreToolUse hook (matcher: Bash) -- auto-point the IDE explorer
+# at whatever host Claude ssh'es to. Claude's tool processes are detached
+# from the pane's tty, so ide-remote-follow can't see them via `kitty @ ls`;
+# this catches the ssh at the source, before it even runs, one-shots included.
+#
+# Reads the hook JSON on stdin, looks for an `ssh` in command position,
+# parses its destination (same flag-walk as ide-remote-follow), and refreshes
+# the TTL'd auto override via `ide-remote --auto`. Silent no-op outside an
+# IDE pane; never blocks the tool call (always exits 0).
+export PATH="$HOME/.local/bin:$PATH"
+case "${KITTY_LISTEN_ON:-}" in
+  *ide.sock-*) ;;
+  *) cat >/dev/null 2>&1; exit 0 ;;    # not inside an IDE
+esac
+
+dest="$(python3 -c '
+import json, shlex, sys
+try:
+    cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
+    toks = shlex.split(cmd)
+except Exception:
+    sys.exit()
+SEPS = {"&&", "||", ";", "|", "&", "(", "{", "then", "else", "do"}
+WRAPPERS = {"sudo", "command", "exec", "setsid", "nohup"}
+def parse_ssh(argv):
+    takes_arg = set("bBcDEeFIiJLlmOopQRSWw")
+    user = prt = tgt = None
+    i = 1
+    while i < len(argv) and tgt is None:
+        a = argv[i]
+        if a in SEPS:
+            return None                          # ssh ended before a target
+        if a.startswith("-") and len(a) > 1:
+            f = a[1]
+            if f == "O":
+                return None                      # control op (-O exit/check), no session
+            if f in takes_arg:
+                val = a[2:] or (argv[i + 1] if i + 1 < len(argv) else "")
+                if not a[2:]:
+                    i += 1
+                if f == "p": prt = val
+                if f == "l": user = val
+        else:
+            tgt = a
+        i += 1
+    if not tgt:
+        return None
+    if tgt.startswith("ssh://"):                 # ssh://[user@]host[:port]
+        tgt = tgt[6:].split("/", 1)[0]
+        if ":" in tgt.rsplit("@", 1)[-1]:
+            tgt, _, prt = tgt.rpartition(":")
+    if tgt.startswith(("-", "/", ".")):          # flag soup / local path: not a host
+        return None
+    if user and "@" not in tgt:
+        tgt = user + "@" + tgt
+    return tgt + (":" + prt if prt else "")
+prev = None
+for i, t in enumerate(toks):
+    # only an ssh in COMMAND position (start / after a separator / wrapper /
+    # env assignment) counts -- "grep ssh file" must not match
+    if t == "ssh" and (prev is None or prev in SEPS or prev in WRAPPERS
+                       or "=" in prev or prev.isdigit()):   # digit: `timeout 30 ssh …`
+        r = parse_ssh(toks[i:])
+        if r:
+            print(r)
+            break
+    prev = t
+' 2>/dev/null)"
+
+[ -n "$dest" ] && ide-remote --auto "$dest" >/dev/null 2>&1
+exit 0

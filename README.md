@@ -70,7 +70,11 @@ scripts.
   connection via ssh multiplexing (`ControlMaster auto` in `~/.ssh/config`).
   For ssh sessions kitty can't see (Claude Code's Bash tool runs detached from
   the pane's tty; tmux), `ide-remote [user@]host[:port]` forces the switch and
-  `ide-remote off` brings the explorer home.
+  `ide-remote off` brings the explorer home. Fully automatic for Claude: a
+  Claude Code PreToolUse hook (`ide-remote-hook`, register on `Bash` in
+  `~/.claude/settings.json`) catches every ssh Claude runs — one-shots
+  included — and refreshes a TTL'd override that lapses ~15 min after the
+  last remote command, drifting the explorer home by itself.
 - **A virtual desktop Claude can pilot** — an isolated graphical environment
   (Docker X11 desktop, a QEMU VM, or a remote box — all over VNC) rendered live
   in the top-left feed pane. Claude gets **eyes** (`ide-vd shot`) and **hands**

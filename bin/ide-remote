@@ -2,6 +2,7 @@
 # Manually point the IDE explorer at a remote filesystem (or bring it back).
 #
 #   ide-remote [user@]host[:port]   sshfs-mount + follow in the explorer
+#   ide-remote --auto [user@]host[:port]   same, but expires (TTL) -- for hooks
 #   ide-remote off                  restore the local explorer
 #   ide-remote                      print the current override
 #
@@ -9,13 +10,17 @@
 # visible in the claude pane's foreground: Claude Code running ssh through its
 # Bash tool (tool processes are detached from the pane's tty, so `kitty @ ls`
 # never lists them), one-shot `ssh host cmd` loops, or a session inside tmux.
+# --auto is the ide-remote-hook entry point: each refresh bumps the file's
+# mtime, and ide-remote-follow drops it after IDE_REMOTE_TTL (900s) of quiet.
 # Auth is still non-interactive: keys, or a live multiplexed master
 # (ControlMaster) from any interactive session to that host.
 export PATH="$HOME/.local/bin:$PATH"
 . ide-sock                   # -> IDE_ID for THIS instance
 f="/tmp/ide-${IDE_ID}-remote-dest"
+fa="/tmp/ide-${IDE_ID}-remote-dest-auto"
 case "${1:-}" in
-  "")           cat "$f" 2>/dev/null || echo "(none)" ;;
-  off|-|local)  rm -f "$f" ;;
+  "")           cat "$f" 2>/dev/null || cat "$fa" 2>/dev/null || echo "(none)" ;;
+  off|-|local)  rm -f "$f" "$fa" ;;
+  --auto)       [ -n "${2:-}" ] && printf '%s' "$2" >"$fa" ;;
   *)            printf '%s' "$1" >"$f" ;;
 esac
