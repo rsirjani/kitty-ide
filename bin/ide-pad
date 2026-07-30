@@ -134,7 +134,12 @@ up() {
   # tree, bound strictly to the tailnet + PAN addresses.
   if command -v smbd >/dev/null && [ -n "$ts_ip" ] && ! alive smbd; then
     local smbdir="$RUN/samba"
-    mkdir -p "$smbdir"
+    # passdb lives outside /tmp so the SMB account survives reboots. iOS
+    # Files browses guest shares fine but fails opening files from guest
+    # sessions — a Registered User login works, so keep a real account
+    # (unix user $USER, the WebDAV password).
+    local smbpriv="$HOME/.config/ide-pad/samba-private"
+    mkdir -p "$smbdir" "$smbpriv"
     cat > "$RUN/smb.conf" <<EOF
 [global]
   server role = standalone server
@@ -151,7 +156,7 @@ up() {
   lock directory = $smbdir
   state directory = $smbdir
   cache directory = $smbdir
-  private dir = $smbdir
+  private dir = $smbpriv
   ncalrpc dir = $smbdir/ncalrpc
   log file = $smbdir/smb.log
   max log size = 100
@@ -161,6 +166,10 @@ up() {
   guest ok = yes
   force user = $USER
 EOF
+    if ! sudo pdbedit --configfile="$RUN/smb.conf" -L 2>/dev/null | grep -q "^$USER:"; then
+      printf '%s\n%s\n' "$dav_pass" "$dav_pass" \
+        | sudo smbpasswd -c "$RUN/smb.conf" -s -a "$USER" >/dev/null
+    fi
     sudo smbd --configfile="$RUN/smb.conf" -D
     cp "$smbdir/smbd.pid" "$RUN/smbd.pid" 2>/dev/null || true
     # Expose the loopback smbd on the tailnet via the tailscale daemon.
@@ -172,7 +181,7 @@ EOF
   [ -n "$ts_url" ] && echo "    tailnet WebDAV $ts_url (Safari)"
   echo "    WebDAV login — user: $dav_user  password: $dav_pass"
   [ -n "$ts_ip" ] && command -v smbd >/dev/null && \
-    echo "    Files app: Connect to Server -> smb://$ts_ip -> Guest -> projects"
+    echo "    Files app: smb://$ts_ip -> Registered User, name $USER, password $dav_pass"
 }
 
 down() {
