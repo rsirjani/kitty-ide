@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Read-on-the-couch bridge: share the projects tree to an iPad over Bluetooth.
+#
+# The school WiFi has client isolation, so nothing can reach the laptop over
+# the network. Instead the laptop advertises a Bluetooth PAN (NAP): the iPad
+# pairs and joins, gets an IP over BNEP from our dnsmasq, and reads
+# ~/projects through a read-only WebDAV server bound to the Bluetooth bridge —
+# Files app / Safari render PDFs natively, which beats mirroring pane pixels
+# over a ~1-2 Mbps radio.
+#
+#   ide-pad up        start PAN + DHCP + WebDAV (asks for sudo)
+#   ide-pad down      stop everything, remove the bridge
+#   ide-pad pair      make the laptop pairable and walk through iPad pairing
+#   ide-pad status    show what's running
+#
+# iPad, after `ide-pad pair` once and `ide-pad up`:
+#   Settings > Bluetooth > tap the laptop  → joins the PAN
+#   Files > ⋯ > Connect to Server → http://172.20.70.1:8080  (WebDAV, read-only)
+#   or Safari → http://172.20.70.1:8080 for plain browsing.
+set -euo pipefail
+
+BRIDGE=pan0
+ADDR=172.20.70.1
+CIDR=$ADDR/24
+DHCP_RANGE=172.20.70.10,172.20.70.50,12h
+WEBDAV_PORT=8080
+SHARE_DIR=${IDE_PAD_DIR:-$HOME/projects}
+RUN=/tmp/ide-pad
+ADAPTER_PATH=/org/bluez/hci0
+
+die() { echo "$*" >&2; exit 1; }
+
+# Is the pid in $1's pidfile alive? /proc probe, not kill -0 — dnsmasq runs as
+# root and kill -0 from the user would report EPERM as "dead".
+alive() { [ -f "$RUN/$1.pid" ] && [ -d "/proc/$(cat "$RUN/$1.pid")" ]; }
+
+adapter_set() { # property bool
+  busctl set-property org.bluez "$ADAPTER_PATH" org.bluez.Adapter1 "$1" b "$2"
+}
+
+nap_register() {
+  busctl call org.bluez "$ADAPTER_PATH" org.bluez.NetworkServer1 Register ss nap "$BRIDGE"
+}
+
+nap_unregister() {
+  busctl call org.bluez "$ADAPTER_PATH" org.bluez.NetworkServer1 Unregister s nap 2>/dev/null || true
+}
+
+up() {
+  mkdir -p "$RUN"
+
+  # Bridge the BNEP links will enslave to, with our static gateway address.
+  if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+    sudo ip link add name "$BRIDGE" type bridge
+  fi
+  sudo ip addr replace "$CIDR" dev "$BRIDGE"
+  sudo ip link set "$BRIDGE" up
+
+  # Advertise NAP: bluetoothd adds each connecting device's bnep interface
+  # into the bridge for us. Freshly-created bridges can race bluetoothd, so
+  # retry briefly; "already exists" also lands here and is fine.
+  for _ in 1 2 3; do
+    nap_register >/dev/null 2>&1 && break
+    sleep 1
+  done
+
+  # DHCP for the iPad, strictly scoped to the bridge.
+  if ! alive dnsmasq; then
+    sudo dnsmasq --conf-file=/dev/null \
+      --interface="$BRIDGE" --bind-interfaces --except-interface=lo \
+      --dhcp-range="$DHCP_RANGE" --port=0 \
+      --pid-file="$RUN/dnsmasq.pid"
+  fi
+
+  # Read-only WebDAV of the share dir, bound to the Bluetooth address only —
+  # never reachable from the school network.
+  if ! alive webdav; then
+    nohup rclone serve webdav "$SHARE_DIR" \
+      --addr "$ADDR:$WEBDAV_PORT" --read-only \
+      >"$RUN/webdav.log" 2>&1 &
+    echo $! > "$RUN/webdav.pid"
+  fi
+
+  adapter_set Discoverable true >/dev/null
+  echo "up: PAN '$BRIDGE' at $ADDR, WebDAV http://$ADDR:$WEBDAV_PORT ($SHARE_DIR, read-only)"
+  echo "iPad: Settings > Bluetooth > tap this laptop, then Files/Safari > http://$ADDR:$WEBDAV_PORT"
+}
+
+down() {
+  [ -f "$RUN/webdav.pid" ] && { kill "$(cat "$RUN/webdav.pid")" 2>/dev/null || true; rm -f "$RUN/webdav.pid"; }
+  [ -f "$RUN/dnsmasq.pid" ] && { sudo kill "$(cat "$RUN/dnsmasq.pid")" 2>/dev/null || true; rm -f "$RUN/dnsmasq.pid"; }
+  nap_unregister
+  ip link show "$BRIDGE" >/dev/null 2>&1 && sudo ip link del "$BRIDGE"
+  adapter_set Discoverable false >/dev/null 2>&1 || true
+  echo "down"
+}
+
+status() {
+  ip -br addr show "$BRIDGE" 2>/dev/null || echo "$BRIDGE: absent"
+  for p in dnsmasq webdav; do
+    if alive "$p"; then
+      echo "$p: running (pid $(cat "$RUN/$p.pid"))"
+    else
+      echo "$p: stopped"
+    fi
+  done
+  # Enslaved bnep* means an iPad is currently connected.
+  ip link show master "$BRIDGE" 2>/dev/null | sed -n 's/^[0-9]*: \([^:@]*\).*/pan client: \1/p'
+}
+
+pair() {
+  adapter_set Powered true >/dev/null
+  adapter_set Pairable true >/dev/null
+  adapter_set Discoverable true >/dev/null
+  cat <<EOF
+Pairing mode on. On the iPad: Settings > Bluetooth > pick this laptop.
+bluetoothctl opens next — when the confirmation prompt appears, check the
+code matches the iPad and type: yes
+(exit when done; pairing is one-time)
+EOF
+  exec bluetoothctl
+}
+
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  pair) pair ;;
+  status) status ;;
+  *) die "usage: ide-pad up|down|pair|status" ;;
+esac
