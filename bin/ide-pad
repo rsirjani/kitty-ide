@@ -49,6 +49,19 @@ nap_unregister() {
 up() {
   mkdir -p "$RUN"
 
+  # iOS Files refuses anonymous WebDAV (Safari doesn't) — serve with basic
+  # auth. Stable random password, generated once, shown on every `up`.
+  local passfile="$HOME/.config/ide-pad/webdav.pass"
+  mkdir -p "$(dirname "$passfile")"
+  [ -f "$passfile" ] || openssl rand -hex 8 > "$passfile"
+  chmod 600 "$passfile"
+  local dav_user=ipad dav_pass; dav_pass=$(cat "$passfile")
+
+  # Restart the servers so flag changes (auth, share dir) always apply.
+  for w in webdav webdav-ts; do
+    [ -f "$RUN/$w.pid" ] && { kill "$(cat "$RUN/$w.pid")" 2>/dev/null || true; rm -f "$RUN/$w.pid"; }
+  done
+
   # Bridge the BNEP links will enslave to, with our static gateway address.
   if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
     sudo ip link add name "$BRIDGE" type bridge
@@ -77,6 +90,7 @@ up() {
   if ! alive webdav; then
     nohup rclone serve webdav "$SHARE_DIR" \
       --addr "$ADDR:$WEBDAV_PORT" --read-only \
+      --user "$dav_user" --pass "$dav_pass" \
       >"$RUN/webdav.log" 2>&1 &
     echo $! > "$RUN/webdav.pid"
   fi
@@ -90,6 +104,7 @@ up() {
   if [ -n "$ts_ip" ] && ! alive webdav-ts; then
     nohup rclone serve webdav "$SHARE_DIR" \
       --addr "$ts_ip:$WEBDAV_PORT" --read-only \
+      --user "$dav_user" --pass "$dav_pass" \
       >"$RUN/webdav-ts.log" 2>&1 &
     echo $! > "$RUN/webdav-ts.pid"
   fi
@@ -97,6 +112,7 @@ up() {
   adapter_set Discoverable true >/dev/null
   echo "up: PAN '$BRIDGE' at $ADDR, WebDAV http://$ADDR:$WEBDAV_PORT ($SHARE_DIR, read-only)"
   [ -n "$ts_ip" ] && echo "    tailnet WebDAV http://$ts_ip:$WEBDAV_PORT (iPad: Tailscale app + Safari/Files)"
+  echo "    Files login — user: $dav_user  password: $dav_pass"
 }
 
 down() {
