@@ -8,7 +8,7 @@ index 0d94ea2..0e2ff97 100644
  
  pub use bridge::*;
 diff --git a/src/browser/bridge.rs b/src/browser/bridge.rs
-index 7b3d629..84c0bcd 100644
+index 7b3d629..212dc22 100644
 --- a/src/browser/bridge.rs
 +++ b/src/browser/bridge.rs
 @@ -116,10 +116,27 @@ fn main() -> io::Result<Option<i32>> {
@@ -61,24 +61,48 @@ index 7b3d629..84c0bcd 100644
  #[no_mangle]
  pub extern "C" fn carbonyl_bridge_main() {
      if let Some(code) = main().unwrap() {
-@@ -377,6 +405,11 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
+@@ -367,6 +395,19 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
+ 
+                             emit!(go_to(c_str.as_ptr()))
+                         }
++                        NavigationAction::OpenExternal(url) => {
++                            // Ctrl+O: hand the URL to a real browser. The
++                            // command comes from $CARBONYL_OPEN_EXTERNAL_CMD,
++                            // defaulting to the IDE's Virtual-Desktop Chromium
++                            // (persistent profile: password manager, 2FA,
++                            // extensions all work there). The inner `&` lets
++                            // sh exit immediately so status() doesn't block.
++                            let cmd = std::env::var("CARBONYL_OPEN_EXTERNAL_CMD")
++                                .unwrap_or_else(|_| "ide-open desktop".to_owned());
++                            let _ = std::process::Command::new("sh")
++                                .args(["-c", &format!("{cmd} \"$0\" >/dev/null 2>&1 &"), &url])
++                                .status();
++                        }
+                     };
+ 
+                     return false;
+@@ -377,6 +418,15 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
  
                      match event {
                          Exit => (),
 +                        Paste { text } => {
-+                            // Inject the clipboard text into the focused element
-+                            // over CDP (the terminal handed it to us via OSC 52).
-+                            crate::browser::cdp::insert_text(&text);
++                            // The address bar takes the paste when focused;
++                            // otherwise inject the clipboard text into the
++                            // focused page element over CDP (the terminal
++                            // handed it to us via OSC 52).
++                            if !renderer.paste(&text) {
++                                crate::browser::cdp::insert_text(&text);
++                            }
 +                        }
                          Scroll { delta } => {
                              let scale = get_scale();
  
 diff --git a/src/browser/cdp.rs b/src/browser/cdp.rs
 new file mode 100644
-index 0000000..4960f5a
+index 0000000..c289ad8
 --- /dev/null
 +++ b/src/browser/cdp.rs
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,410 @@
 +//! Tiny synchronous Chrome DevTools Protocol client.
 +//!
 +//! Carbonyl rasterizes page text straight into the framebuffer (bitmap mode),
@@ -138,6 +162,59 @@ index 0000000..4960f5a
 +    let params = format!(r#"{{"text":"{}"}}"#, json_escape(text));
 +
 +    call("Input.insertText", &params).is_some()
++}
++
++/// Fill the page's login form: the first password field gets `password`, the
++/// nearest preceding text/email field gets `username`. Values are set through
++/// the native value setter and followed by `input`/`change` events so
++/// framework-driven forms (React/Vue) see them as real typing. Only ever runs
++/// on an explicit user keypress (Ctrl+L) — never automatically on page load.
++pub fn fill_login(username: &str, password: &str) -> bool {
++    let js = format!(
++        r#"(() => {{
++  const set = (el, v) => {{
++    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(el, v);
++    el.dispatchEvent(new Event('input', {{bubbles: true}}));
++    el.dispatchEvent(new Event('change', {{bubbles: true}}));
++  }};
++  const pw = document.querySelector('input[type=password]');
++  if (!pw) return false;
++  const inputs = Array.from(document.querySelectorAll('input'));
++  const user = inputs.slice(0, inputs.indexOf(pw)).reverse()
++    .find(el => ['text', 'email', 'tel', ''].includes(el.type || ''));
++  if (user) set(user, '{u}');
++  set(pw, '{p}');
++  return true;
++}})()"#,
++        u = js_escape(username),
++        p = js_escape(password),
++    );
++    let params = format!(
++        r#"{{"expression":"{}","returnByValue":true}}"#,
++        json_escape(&js)
++    );
++
++    match call("Runtime.evaluate", &params) {
++        Some(resp) => resp.contains(r#""value":true"#),
++        None => false,
++    }
++}
++
++/// Escape a string for inclusion inside a single-quoted JS string literal.
++fn js_escape(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++
++    for c in text.chars() {
++        match c {
++            '\\' => out.push_str("\\\\"),
++            '\'' => out.push_str("\\'"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            c => out.push(c),
++        }
++    }
++
++    out
 +}
 +
 +/// Make a single CDP call and return the raw JSON response text.
@@ -679,10 +756,10 @@ index 9d16b5f..f32b4ab 100644
  pub use render_thread::*;
 diff --git a/src/output/graphics.rs b/src/output/graphics.rs
 new file mode 100644
-index 0000000..bad79c8
+index 0000000..02c2712
 --- /dev/null
 +++ b/src/output/graphics.rs
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,559 @@
 +use std::io::{self, Write};
 +
 +use crate::gfx::Size;
@@ -701,10 +778,24 @@ index 0000000..bad79c8
 +pub struct KittyGraphics {
 +    /// Latest framebuffer, packed as RGB (3 bytes per pixel).
 +    rgb: Vec<u8>,
++    /// Scratch buffer the next frame is swizzled into before diffing, swapped
++    /// with `rgb` — no per-frame allocation.
++    scratch: Vec<u8>,
 +    /// Size of the framebuffer in pixels.
 +    pixels: Size,
-+    /// Whether the framebuffer changed since the last `encode`.
++    /// Whether anything changed since the last `encode`.
 +    dirty: bool,
++    /// The terminal holds image data matching `rgb`'s geometry, so changed
++    /// rows can be sent as frame edits instead of full retransmits.
++    transmitted: bool,
++    /// A full retransmit is required (first frame, or the size changed).
++    full_needed: bool,
++    /// Rows changed since the last transmit, as an inclusive `(top, bottom)`
++    /// band. Unioned across frames until `encode` flushes it.
++    band: Option<(usize, usize)>,
++    /// The magnifier crop changed (zoom/pan): the placement must be re-sent,
++    /// but the image data is still valid.
++    view_dirty: bool,
 +    /// Rotating counter for unique temp-file names.
 +    counter: u64,
 +    /// Recently written temp files, reaped once the terminal has read them.
@@ -725,8 +816,13 @@ index 0000000..bad79c8
 +    pub fn new() -> Self {
 +        KittyGraphics {
 +            rgb: Vec::new(),
++            scratch: Vec::new(),
 +            pixels: Size::new(0, 0),
 +            dirty: false,
++            transmitted: false,
++            full_needed: false,
++            band: None,
++            view_dirty: false,
 +            counter: 0,
 +            recent: std::collections::VecDeque::new(),
 +            zoom: 1.0,
@@ -752,6 +848,7 @@ index 0000000..bad79c8
 +            self.zoom = zoom;
 +            self.clamp_center();
 +            self.dirty = true;
++            self.view_dirty = true;
 +        }
 +    }
 +
@@ -766,6 +863,7 @@ index 0000000..bad79c8
 +        self.center.1 += dy / self.zoom;
 +        self.clamp_center();
 +        self.dirty = true;
++        self.view_dirty = true;
 +    }
 +
 +    /// Snap back to the whole, centered page.
@@ -774,6 +872,7 @@ index 0000000..bad79c8
 +            self.zoom = 1.0;
 +            self.center = (0.5, 0.5);
 +            self.dirty = true;
++            self.view_dirty = true;
 +        }
 +    }
 +
@@ -807,16 +906,48 @@ index 0000000..bad79c8
 +            return;
 +        }
 +
-+        self.rgb.clear();
-+        self.rgb.reserve(count * 3);
-+
-+        for i in 0..count {
++        // Swizzle into the scratch buffer so the previous frame stays around
++        // to diff against. chunks_exact vectorizes; the old per-byte loop was
++        // the hottest line in the blit path.
++        self.scratch.clear();
++        self.scratch.reserve(count * 3);
++        for px in pixels[..count * 4].chunks_exact(4) {
 +            // Source is BGRA, kitty's RGB format (f=24) wants R, G, B.
-+            self.rgb.push(pixels[i * 4 + 2]);
-+            self.rgb.push(pixels[i * 4 + 1]);
-+            self.rgb.push(pixels[i * 4 + 0]);
++            self.scratch.extend_from_slice(&[px[2], px[1], px[0]]);
 +        }
 +
++        let same_geometry = size.width == self.pixels.width
++            && size.height == self.pixels.height
++            && self.rgb.len() == self.scratch.len();
++
++        if same_geometry && self.transmitted {
++            // Find the band of changed rows. memcmp per row from both ends —
++            // an unchanged frame costs one linear scan, a caret blink costs
++            // the scan plus a few-row transmit instead of the whole page.
++            let stride = size.width as usize * 3;
++            let rows = size.height as usize;
++            let row_ne = |r: usize| {
++                self.rgb[r * stride..(r + 1) * stride]
++                    != self.scratch[r * stride..(r + 1) * stride]
++            };
++
++            let Some(top) = (0..rows).find(|&r| row_ne(r)) else {
++                // Identical frame: keep everything, transmit nothing.
++                std::mem::swap(&mut self.rgb, &mut self.scratch);
++                return;
++            };
++            let bottom = (top..rows).rev().find(|&r| row_ne(r)).unwrap_or(top);
++
++            self.band = Some(match self.band {
++                None => (top, bottom),
++                Some((t, b)) => (t.min(top), b.max(bottom)),
++            });
++        } else {
++            self.full_needed = true;
++            self.band = None;
++        }
++
++        std::mem::swap(&mut self.rgb, &mut self.scratch);
 +        self.pixels = size;
 +        self.dirty = true;
 +    }
@@ -828,6 +959,14 @@ index 0000000..bad79c8
 +        b"\x1b_Ga=d,d=I,i=1\x1b\\"
 +    }
 +
++    /// The terminal-side image is gone (the caller emitted `reset()`): the
++    /// next encode must be a full transmit, whatever the diff says.
++    pub fn invalidate(&mut self) {
++        self.transmitted = false;
++        self.full_needed = true;
++        self.band = None;
++    }
++
 +    /// Encode the escape codes that draw the framebuffer into a `cols`x`rows`
 +    /// cell box anchored at the 1-based terminal cell (`col`, `row`). The cursor
 +    /// is saved and restored so the navigation caret is left untouched.
@@ -836,15 +975,10 @@ index 0000000..bad79c8
 +    /// (`t=t`) rather than base64'd inline: a single page can be several
 +    /// megabytes, and pushing that through the pty every frame is the main
 +    /// source of latency. The terminal reads and deletes the file itself.
-+    pub fn encode(&mut self, col: u32, row: u32, cols: u32, rows: u32) -> io::Result<Vec<u8>> {
-+        let mut out = Vec::new();
-+
-+        self.dirty = false;
-+
-+        if self.pixels.width == 0 || self.pixels.height == 0 {
-+            return Ok(out);
-+        }
-+
++    /// Next unique temp-file path, reaping files from earlier frames in case
++    /// the terminal didn't (e.g. it isn't kitty, or doesn't honor t=t
++    /// deletion). By now they've been read.
++    fn next_path(&mut self) -> String {
 +        self.counter = self.counter.wrapping_add(1);
 +        let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
 +        // The name must contain "tty-graphics-protocol" for kitty to delete the
@@ -856,10 +990,6 @@ index 0000000..bad79c8
 +            self.counter
 +        );
 +
-+        std::fs::write(&path, &self.rgb)?;
-+
-+        // Reap files from earlier frames in case the terminal didn't (e.g. it
-+        // isn't kitty, or doesn't honor t=t deletion). By now they've been read.
 +        self.recent.push_back(path.clone());
 +        while self.recent.len() > 2 {
 +            if let Some(old) = self.recent.pop_front() {
@@ -867,40 +997,115 @@ index 0000000..bad79c8
 +            }
 +        }
 +
-+        // Save cursor, move to the content origin.
-+        write!(out, "\x1b7\x1b[{};{}H", row, col)?;
++        path
++    }
 +
-+        // The magnifier shows a sub-rectangle of the framebuffer scaled into the
-+        // same cell box: zooming shrinks the crop, panning moves it. At zoom 1.0
-+        // the crop is the whole image, so this matches the un-zoomed output.
++    /// The `a=p` re-placement command: shows the (possibly cropped) image in
++    /// the cell box without retransmitting any pixel data. The cursor is saved
++    /// and restored so the navigation caret is left untouched.
++    ///
++    /// x,y,w,h  source sub-rectangle to display (the magnifier crop)
++    /// c,r  number of cells to scale the cropped region into
++    /// C=1  do not move the cursor when placing the image
++    fn encode_placement(
++        &self,
++        out: &mut Vec<u8>,
++        col: u32,
++        row: u32,
++        cols: u32,
++        rows: u32,
++    ) -> io::Result<()> {
 +        let (crop_x, crop_y, crop_w, crop_h) = self.crop();
 +
-+        // a=T  transmit and display
-+        // f=24 raw RGB
-+        // t=t  payload is the path to a temporary file the terminal deletes
-+        // s,v  source size in pixels (the full transmitted framebuffer)
-+        // x,y,w,h  source sub-rectangle to display (the magnifier crop)
-+        // c,r  number of cells to scale the cropped region into
-+        // i=1  image id (reused each frame, so the terminal replaces the data)
-+        // p=1  placement id (reused, so the terminal replaces the placement)
-+        // q=2  suppress the terminal's success/error replies
-+        // C=1  do not move the cursor when placing the image
 +        write!(
 +            out,
-+            "\x1b_Ga=T,f=24,t=t,s={},v={},x={},y={},w={},h={},c={},r={},i=1,p=1,q=2,C=1;{}\x1b\\",
-+            self.pixels.width,
-+            self.pixels.height,
-+            crop_x,
-+            crop_y,
-+            crop_w,
-+            crop_h,
-+            cols,
-+            rows,
-+            base64(path.as_bytes())
-+        )?;
++            "\x1b7\x1b[{};{}H\x1b_Ga=p,i=1,p=1,x={},y={},w={},h={},c={},r={},C=1,q=2\x1b\\\x1b8",
++            row, col, crop_x, crop_y, crop_w, crop_h, cols, rows
++        )
++    }
 +
-+        // Restore the cursor.
-+        write!(out, "\x1b8")?;
++    pub fn encode(&mut self, col: u32, row: u32, cols: u32, rows: u32) -> io::Result<Vec<u8>> {
++        let mut out = Vec::new();
++
++        self.dirty = false;
++
++        if self.pixels.width == 0 || self.pixels.height == 0 {
++            return Ok(out);
++        }
++
++        // Pick the cheapest transmit that reflects the pending changes:
++        // - full: first frame, resize, or most rows changed anyway
++        // - band: a few changed rows patched into the terminal-side image
++        // - placement only: zoom/pan moved the crop, pixels are unchanged
++        let height = self.pixels.height as usize;
++        let full = self.full_needed
++            || !self.transmitted
++            || match self.band {
++                // Patching pays off while the changed band is a minority of the
++                // frame; past ~60% just retransmit.
++                Some((top, bottom)) => (bottom - top + 1) * 10 >= height * 6,
++                None => false,
++            };
++
++        if full {
++            let path = self.next_path();
++
++            std::fs::write(&path, &self.rgb)?;
++
++            // The magnifier shows a sub-rectangle of the framebuffer scaled
++            // into the cell box: zooming shrinks the crop, panning moves it.
++            // At zoom 1.0 the crop is the whole image.
++            let (crop_x, crop_y, crop_w, crop_h) = self.crop();
++
++            // a=T  transmit and display
++            // f=24 raw RGB
++            // t=t  payload is the path to a temporary file the terminal deletes
++            // s,v  source size in pixels (the full transmitted framebuffer)
++            // i=1  image id (reused each frame, so the terminal replaces the data)
++            // p=1  placement id (reused, so the terminal replaces the placement)
++            // q=2  suppress the terminal's success/error replies
++            write!(out, "\x1b7\x1b[{};{}H", row, col)?;
++            write!(
++                out,
++                "\x1b_Ga=T,f=24,t=t,s={},v={},x={},y={},w={},h={},c={},r={},i=1,p=1,q=2,C=1;{}\x1b\\",
++                self.pixels.width,
++                self.pixels.height,
++                crop_x,
++                crop_y,
++                crop_w,
++                crop_h,
++                cols,
++                rows,
++                base64(path.as_bytes())
++            )?;
++            write!(out, "\x1b8")?;
++
++            self.transmitted = true;
++        } else if let Some((top, bottom)) = self.band {
++            // Patch just the changed rows into the terminal-side image with a
++            // frame edit (a=f, r=1 edits the root frame in place), then re-send
++            // the placement so every kitty version repaints immediately.
++            let stride = self.pixels.width as usize * 3;
++            let path = self.next_path();
++
++            std::fs::write(&path, &self.rgb[top * stride..(bottom + 1) * stride])?;
++
++            write!(
++                out,
++                "\x1b_Ga=f,i=1,r=1,x=0,y={},s={},v={},f=24,t=t,q=2;{}\x1b\\",
++                top,
++                self.pixels.width,
++                bottom - top + 1,
++                base64(path.as_bytes())
++            )?;
++            self.encode_placement(&mut out, col, row, cols, rows)?;
++        } else if self.view_dirty {
++            self.encode_placement(&mut out, col, row, cols, rows)?;
++        }
++
++        self.band = None;
++        self.full_needed = false;
++        self.view_dirty = false;
 +
 +        Ok(out)
 +    }
@@ -957,6 +1162,84 @@ index 0000000..bad79c8
 +            .unwrap()
 +            .parse()
 +            .unwrap()
++    }
++
++    /// BGRA framebuffer with every pixel set to `v`.
++    fn frame(w: u32, h: u32, v: u8) -> Vec<u8> {
++        vec![v; (w * h * 4) as usize]
++    }
++
++    #[test]
++    fn unchanged_frame_transmits_nothing() {
++        let mut g = with_frame(8, 8);
++
++        g.encode(1, 2, 10, 5).unwrap(); // initial full transmit
++        g.store(&frame(8, 8, 0), Size::new(8, 8));
++        assert!(!g.dirty());
++        assert!(g.encode(1, 2, 10, 5).unwrap().is_empty());
++    }
++
++    #[test]
++    fn small_change_patches_band() {
++        let mut g = with_frame(8, 8);
++
++        g.encode(1, 2, 10, 5).unwrap();
++
++        // Change only row 3.
++        let mut pixels = frame(8, 8, 0);
++        for b in &mut pixels[(3 * 8 * 4)..(4 * 8 * 4)] {
++            *b = 255;
++        }
++        g.store(&pixels, Size::new(8, 8));
++        assert!(g.dirty());
++
++        let cmd = String::from_utf8(g.encode(1, 2, 10, 5).unwrap()).unwrap();
++        assert!(cmd.contains("a=f"), "expected frame edit: {cmd}");
++        assert!(cmd.contains("a=p"), "expected re-placement: {cmd}");
++        assert!(!cmd.contains("a=T"), "no full retransmit: {cmd}");
++        assert_eq!(field(&cmd, "y"), 3); // band offset
++        assert_eq!(field(&cmd, "v"), 1); // band height
++    }
++
++    #[test]
++    fn mostly_changed_frame_retransmits_fully() {
++        let mut g = with_frame(8, 8);
++
++        g.encode(1, 2, 10, 5).unwrap();
++        g.store(&frame(8, 8, 255), Size::new(8, 8)); // every row changed
++
++        let cmd = String::from_utf8(g.encode(1, 2, 10, 5).unwrap()).unwrap();
++        assert!(cmd.contains("a=T"), "expected full transmit: {cmd}");
++        assert!(!cmd.contains("a=f"), "no frame edit: {cmd}");
++    }
++
++    #[test]
++    fn zoom_after_transmit_replaces_placement_only() {
++        let mut g = with_frame(800, 600);
++
++        g.encode(1, 2, 100, 50).unwrap();
++        g.zoom_by(2.0);
++
++        let cmd = String::from_utf8(g.encode(1, 2, 100, 50).unwrap()).unwrap();
++        assert!(cmd.contains("a=p"), "expected placement: {cmd}");
++        assert!(!cmd.contains("a=T") && !cmd.contains("a=f"), "no data: {cmd}");
++        assert_eq!(field(&cmd, "w"), 400);
++        assert_eq!(field(&cmd, "h"), 300);
++    }
++
++    #[test]
++    fn invalidate_forces_full_retransmit() {
++        let mut g = with_frame(8, 8);
++
++        g.encode(1, 2, 10, 5).unwrap();
++        g.invalidate();
++
++        // Even a tiny change must now go out as a full a=T transmit.
++        let mut pixels = frame(8, 8, 0);
++        pixels[0] = 255;
++        g.store(&pixels, Size::new(8, 8));
++        let cmd = String::from_utf8(g.encode(1, 2, 10, 5).unwrap()).unwrap();
++        assert!(cmd.contains("a=T"), "expected full transmit: {cmd}");
 +    }
 +
 +    #[test]
@@ -1037,7 +1320,7 @@ index 0000000..bad79c8
 +    }
 +}
 diff --git a/src/output/renderer.rs b/src/output/renderer.rs
-index f515cad..5286257 100644
+index f515cad..f127f78 100644
 --- a/src/output/renderer.rs
 +++ b/src/output/renderer.rs
 @@ -7,19 +7,24 @@ use unicode_segmentation::UnicodeSegmentation;
@@ -1078,7 +1361,7 @@ index f515cad..5286257 100644
          }
      }
  
-@@ -37,10 +47,80 @@ impl Renderer {
+@@ -37,10 +47,146 @@ impl Renderer {
      }
  
      pub fn keypress(&mut self, key: &Key) -> io::Result<NavigationAction> {
@@ -1094,6 +1377,29 @@ index f515cad..5286257 100644
 +        // is rasterized into the framebuffer and never reaches us directly, so
 +        // we ask Chromium for the selection and hand it to the terminal (and
 +        // vice-versa for paste) — see `browser::cdp`.
++        // While the address bar is focused, Ctrl+C copies the bar's own
++        // selection and Ctrl+V pastes into it (the OSC 52 reply comes back as
++        // a paste event that `paste` routes to the bar).
++        if editing {
++            match key.char {
++                // Ctrl+C
++                0x03 => {
++                    if let Some(text) = self.nav.selected_text() {
++                        self.write_clipboard(&text)?;
++                    }
++                    return Ok(NavigationAction::Ignore);
++                }
++                // Ctrl+V
++                0x16 => {
++                    let mut out = io::stdout();
++                    out.write_all(b"\x1b]52;c;?\x07")?;
++                    out.flush()?;
++                    return Ok(NavigationAction::Ignore);
++                }
++                _ => {}
++            }
++        }
++
 +        if !editing && crate::browser::cdp::enabled() {
 +            match key.char {
 +                // Ctrl+C
@@ -1109,6 +1415,15 @@ index f515cad..5286257 100644
 +                    let mut out = io::stdout();
 +                    out.write_all(b"\x1b]52;c;?\x07")?;
 +                    out.flush()?;
++                    return Ok(NavigationAction::Ignore);
++                }
++                // Ctrl+L — fill the page's login form from the system keyring.
++                // Explicit keypress only, exact-host match only: credentials
++                // stored with `ide-web-cred add <host>` (secret-tool under the
++                // hood) are looked up for the current page's host and injected
++                // over CDP. A look-alike domain never matches a stored host.
++                0x0c => {
++                    self.fill_login_from_keyring();
 +                    return Ok(NavigationAction::Ignore);
 +                }
 +                _ => {}
@@ -1156,16 +1471,52 @@ index f515cad..5286257 100644
 +        out.flush()
 +    }
 +
++    /// Route pasted text to the address bar when it's focused. Returns false
++    /// when unfocused so the caller injects it into the page instead.
++    pub fn paste(&mut self, text: &str) -> bool {
++        self.nav.insert_text(text)
++    }
++
++    /// Look up credentials for the current page's host in the system keyring
++    /// (gnome-keyring via `secret-tool`) and fill the page's login form over
++    /// CDP. Missing tool, no stored entry, or no form all degrade to nothing.
++    fn fill_login_from_keyring(&self) {
++        let Some(host) = url_host(self.nav.display_url()) else {
++            return;
++        };
++        let lookup = |field: &str| -> Option<String> {
++            let out = std::process::Command::new("secret-tool")
++                .args(["lookup", "service", "carbonyl", "domain", &host, "field", field])
++                .output()
++                .ok()?;
++
++            if !out.status.success() {
++                return None;
++            }
++
++            let secret = String::from_utf8(out.stdout).ok()?;
++            let secret = secret.trim_end_matches('\n');
++
++            (!secret.is_empty()).then(|| secret.to_owned())
++        };
++
++        if let (Some(user), Some(pass)) = (lookup("username"), lookup("password")) {
++            crate::browser::cdp::fill_login(&user, &pass);
++        }
++    }
++
      pub fn mouse_up(&mut self, origin: Point) -> io::Result<NavigationAction> {
          let action = self.nav.mouse_up(origin);
  
-@@ -69,6 +149,14 @@ impl Renderer {
+@@ -69,6 +215,16 @@ impl Renderer {
          self.nav.set_size(size);
          self.size = size;
  
 +        // Drop any image we transmitted at the old size so the terminal doesn't
 +        // keep a stale placement around while we redraw at the new size.
-+        if self.graphics.is_some() {
++        if let Some(graphics) = &mut self.graphics {
++            graphics.invalidate();
++
 +            let mut stdout = io::stdout();
 +            let _ = stdout.write_all(KittyGraphics::reset());
 +            let _ = stdout.flush();
@@ -1174,7 +1525,7 @@ index f515cad..5286257 100644
          let mut x = 0;
          let mut y = 0;
          let bound = size.width - 1;
-@@ -120,11 +208,31 @@ impl Renderer {
+@@ -120,11 +276,31 @@ impl Renderer {
  
          self.painter.end(self.nav.cursor())?;
  
@@ -1206,6 +1557,35 @@ index f515cad..5286257 100644
          let viewport = self.size.cast::<usize>();
  
          if pixels.len() < viewport.width * viewport.height * 8 * 4 {
+@@ -282,3 +458,28 @@ impl Renderer {
+         }
+     }
+ }
++
++/// The host part of a URL ("https://example.com:8080/x" -> "example.com").
++/// Used as the exact-match key for keyring credential lookups.
++fn url_host(url: &str) -> Option<String> {
++    let rest = url.split("://").nth(1)?;
++    let host = rest.split(['/', '?', '#']).next()?;
++    let host = host.rsplit('@').next()?; // drop userinfo if present
++    let host = host.split(':').next()?; // drop port
++
++    (!host.is_empty()).then(|| host.to_ascii_lowercase())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::url_host;
++
++    #[test]
++    fn extracts_host_for_keyring_lookup() {
++        assert_eq!(url_host("https://example.com/a?b#c"), Some("example.com".into()));
++        assert_eq!(url_host("https://Sub.Example.com:8443/x"), Some("sub.example.com".into()));
++        assert_eq!(url_host("https://user@example.com/"), Some("example.com".into()));
++        assert_eq!(url_host("about:blank"), None);
++        assert_eq!(url_host("https://"), None);
++    }
++}
 diff --git a/src/output/window.rs b/src/output/window.rs
 index a53c507..912e556 100644
 --- a/src/output/window.rs
@@ -1256,21 +1636,453 @@ index a53c507..912e556 100644
          self.cells = Size::new(term.width.max(1), term.height.max(2) - 1).cast();
          self.browser = self.cells.cast::<f32>().mul(self.scale).ceil().cast();
 diff --git a/src/ui/navigation.rs b/src/ui/navigation.rs
-index 97d669b..3e6662f 100644
+index 97d669b..3760dc1 100644
 --- a/src/ui/navigation.rs
 +++ b/src/ui/navigation.rs
-@@ -63,8 +63,8 @@ impl Navigation {
-                 if let Some(url) = &mut self.url {
-                     // TODO: Unicode
-                     match key.char {
+@@ -15,6 +15,9 @@ pub enum NavigationAction {
+     GoBack(),
+     GoForward(),
+     Refresh(),
++    /// Hand the URL to an external browser (Ctrl+O — e.g. the real Chromium
++    /// in the IDE's Virtual Desktop, for logins/2FA/passkeys/extensions).
++    OpenExternal(String),
+ }
+ 
+ #[derive(Debug)]
+@@ -24,10 +27,25 @@ pub struct NavigationElement {
+     pub foreground: Color,
+ }
+ 
++/// First text column of the URL field (after the [❮][❯][↻] buttons + padding).
++const URL_COL: usize = 11;
++
+ pub struct Navigation {
+     url: Option<String>,
+     size: Size,
++    /// Caret position as a char index into the URL. `Some` means the address
++    /// bar is focused ("editing mode").
+     cursor: Option<usize>,
++    /// Selection anchor (char index). The selection is `anchor..cursor` in
++    /// either direction; `None` or `anchor == cursor` means no selection.
++    anchor: Option<usize>,
++    /// True between a mouse-down on the URL field and the matching mouse-up:
++    /// mouse-moves extend the selection instead of reaching the page.
++    dragging: bool,
++    /// The mouse-down that started the current drag happened while the bar was
++    /// unfocused — if it turns out to be a plain click (no drag), select all,
++    /// like a browser omnibox focusing.
++    focus_click: bool,
+     can_go_back: bool,
+     can_go_forward: bool,
+ }
+@@ -38,13 +56,83 @@ impl Navigation {
+             url: None,
+             size: (0, 0).into(),
+             cursor: None,
++            anchor: None,
++            dragging: false,
++            focus_click: false,
+             can_go_back: false,
+             can_go_forward: false,
+         }
+     }
+ 
+     pub fn cursor(&self) -> Option<Point> {
+-        Some((11 + self.cursor? as i32, 0).into())
++        Some((URL_COL as i32 + self.cursor? as i32, 0).into())
++    }
++
++    fn chars_len(&self) -> usize {
++        self.display_url().chars().count()
++    }
++
++    /// Byte offset of the `char_idx`-th character (clamped to the end).
++    fn byte_index(url: &str, char_idx: usize) -> usize {
++        url.char_indices()
++            .nth(char_idx)
++            .map(|(i, _)| i)
++            .unwrap_or(url.len())
++    }
++
++    /// Ordered, non-empty selection as a char range.
++    fn selection(&self) -> Option<(usize, usize)> {
++        let (a, c) = (self.anchor?, self.cursor?);
++        if a == c {
++            None
++        } else {
++            Some((a.min(c), a.max(c)))
++        }
++    }
++
++    /// The selected slice of the URL, if any.
++    pub fn selected_text(&self) -> Option<String> {
++        let (start, end) = self.selection()?;
++        let url = self.url.as_deref()?;
++        let (s, e) = (Self::byte_index(url, start), Self::byte_index(url, end));
++
++        Some(url[s..e].to_owned())
++    }
++
++    /// Remove the selected range, leaving the caret where it collapsed.
++    fn delete_selection(&mut self) -> bool {
++        let Some((start, end)) = self.selection() else {
++            return false;
++        };
++        if let Some(url) = &mut self.url {
++            let (s, e) = (Self::byte_index(url, start), Self::byte_index(url, end));
++
++            url.replace_range(s..e, "");
++            self.cursor = Some(start);
++        }
++        self.anchor = None;
++
++        true
++    }
++
++    /// Insert text at the caret (replacing the selection). Returns false when
++    /// the bar isn't focused, so the caller can route the text to the page.
++    pub fn insert_text(&mut self, text: &str) -> bool {
++        if self.cursor.is_none() {
++            return false;
++        }
++
++        self.delete_selection();
++
++        let cursor = self.cursor.unwrap_or(0);
++        if let Some(url) = &mut self.url {
++            let at = Self::byte_index(url, cursor);
++
++            url.insert_str(at, text);
++            self.cursor = Some(cursor + text.chars().count());
++        }
++
++        true
+     }
+ 
+     pub fn keypress(&mut self, key: &Key) -> NavigationAction {
+@@ -53,6 +141,12 @@ impl Navigation {
+             _ => key.modifiers.alt,
+         };
+ 
++        // Ctrl+O: open the current URL (as shown in the bar, edits included)
++        // in the external browser, focused or not.
++        if key.char == 0x0f {
++            return NavigationAction::OpenExternal(self.display_url().to_owned());
++        }
++
+         match self.cursor {
+             None => match (modifier_key, key.char) {
+                 (true, 0x14) => NavigationAction::GoBack(),
+@@ -60,38 +154,70 @@ impl Navigation {
+                 _ => NavigationAction::Forward,
+             },
+             Some(cursor) => {
+-                if let Some(url) = &mut self.url {
+-                    // TODO: Unicode
+-                    match key.char {
 -                        // Return
 -                        0x0d => return NavigationAction::GoTo(url.clone()),
-+                        // Return (CR or LF)
-+                        0x0d | 0x0a => return NavigationAction::GoTo(resolve_url(url)),
-                         // Up
-                         0x11 => self.cursor = Some(0),
-                         // Down
-@@ -219,3 +219,90 @@ impl Navigation {
+-                        // Up
+-                        0x11 => self.cursor = Some(0),
+-                        // Down
+-                        0x12 => self.cursor = Some(url.width()),
+-                        // Right
+-                        0x13 => self.cursor = Some((cursor + 1).min(url.width())),
+-                        // Left
+-                        0x14 => self.cursor = Some(if cursor > 0 { cursor - 1 } else { 0 }),
+-                        // Backspace
+-                        0x7f => {
+-                            if cursor > 0 {
+-                                url.remove(cursor - 1);
++                if self.url.is_none() {
++                    return NavigationAction::Forward;
++                }
++
++                let len = self.chars_len();
++
++                match key.char {
++                    // Return (CR or LF)
++                    0x0d | 0x0a => {
++                        let url = self.url.as_deref().unwrap_or("");
++
++                        return NavigationAction::GoTo(resolve_url(url));
++                    }
++                    // Ctrl+A: select all
++                    0x01 => {
++                        self.anchor = Some(0);
++                        self.cursor = Some(len);
++                    }
++                    // Up: caret to start
++                    0x11 => {
++                        self.cursor = Some(0);
++                        self.anchor = None;
++                    }
++                    // Down: caret to end
++                    0x12 => {
++                        self.cursor = Some(len);
++                        self.anchor = None;
++                    }
++                    // Right: collapse selection to its right edge, else advance
++                    0x13 => {
++                        self.cursor = Some(match self.selection() {
++                            Some((_, end)) => end,
++                            None => (cursor + 1).min(len),
++                        });
++                        self.anchor = None;
++                    }
++                    // Left: collapse selection to its left edge, else retreat
++                    0x14 => {
++                        self.cursor = Some(match self.selection() {
++                            Some((start, _)) => start,
++                            None => cursor.saturating_sub(1),
++                        });
++                        self.anchor = None;
++                    }
++                    // Backspace: delete selection, else the char before the caret
++                    0x7f => {
++                        if !self.delete_selection() && cursor > 0 {
++                            if let Some(url) = &mut self.url {
++                                let at = Self::byte_index(url, cursor - 1);
+ 
++                                url.remove(at);
+                                 self.cursor = Some(cursor - 1);
+                             }
+                         }
+-                        key => {
+-                            url.insert(cursor, key as char);
+-
+-                            self.cursor = Some((cursor + 1).min(url.width()))
+-                        }
+                     }
+-
+-                    NavigationAction::Ignore
+-                } else {
+-                    NavigationAction::Forward
++                    // Printable: replace selection / insert at caret
++                    key @ 0x20..=0x7e => {
++                        self.insert_text(&(key as char).to_string());
++                    }
++                    // Other control chars: swallow, never insert into the URL
++                    _ => {}
+                 }
++
++                NavigationAction::Ignore
+             }
+         }
+     }
+@@ -108,39 +234,91 @@ impl Navigation {
+     }
+ 
+     pub fn mouse_up(&mut self, origin: Point) -> NavigationAction {
++        if self.dragging {
++            self.dragging = false;
++
++            // A plain click (no drag) that focused the bar selects the whole
++            // URL, omnibox-style — type to replace, or click again to place
++            // the caret.
++            if self.focus_click && self.selection().is_none() {
++                let len = self.chars_len();
++
++                if len > 0 {
++                    self.anchor = Some(0);
++                    self.cursor = Some(len);
++                }
++            }
++            self.focus_click = false;
++
++            return NavigationAction::Ignore;
++        }
++
+         if origin.y != 0 {
+             self.cursor = None;
++            self.anchor = None;
+ 
+             NavigationAction::Forward
+         } else {
+             NavigationAction::Ignore
+         }
+     }
++
+     pub fn mouse_down(&mut self, origin: Point) -> NavigationAction {
+         if origin.y != 0 {
+             self.cursor = None;
++            self.anchor = None;
+ 
+             return NavigationAction::Forward;
+         }
+ 
+-        self.cursor = None;
+-
+         return match origin.x {
+-            0..=2 => NavigationAction::GoBack(),
+-            3..=5 => NavigationAction::GoForward(),
+-            6..=8 => NavigationAction::Refresh(),
+-            11.. => {
+-                self.cursor = Some(self.url_size().min(origin.x as usize - 11));
++            0..=2 => {
++                self.cursor = None;
++                self.anchor = None;
++                NavigationAction::GoBack()
++            }
++            3..=5 => {
++                self.cursor = None;
++                self.anchor = None;
++                NavigationAction::GoForward()
++            }
++            6..=8 => {
++                self.cursor = None;
++                self.anchor = None;
++                NavigationAction::Refresh()
++            }
++            9.. => {
++                let col = (origin.x as usize).saturating_sub(URL_COL);
++                let at = self.chars_len().min(col);
+ 
+-                log::debug!("setting cursor to {:?}", self.cursor);
++                self.focus_click = self.cursor.is_none();
++                self.cursor = Some(at);
++                self.anchor = Some(at);
++                self.dragging = true;
++
++                log::debug!("caret set to {:?}", self.cursor);
+ 
+                 NavigationAction::Ignore
+             }
+             _ => NavigationAction::Ignore,
+         };
+     }
+-    pub fn mouse_move(&mut self, _origin: Point) -> NavigationAction {
+-        NavigationAction::Forward
++
++    pub fn mouse_move(&mut self, origin: Point) -> NavigationAction {
++        if !self.dragging {
++            return NavigationAction::Forward;
++        }
++
++        // Dragging extends the selection; moving invalidates click-to-select-all.
++        let col = (origin.x.max(0) as usize).saturating_sub(URL_COL);
++        let at = self.chars_len().min(col);
++
++        if Some(at) != self.cursor {
++            self.focus_click = false;
++            self.cursor = Some(at);
++        }
++
++        NavigationAction::Ignore
+     }
+ 
+     pub fn push(&mut self, url: &str, can_go_back: bool, can_go_forward: bool) {
+@@ -149,7 +327,8 @@ impl Navigation {
+             (_, None) => true,
+             (_, Some(current)) => current != url,
+         } {
+-            self.cursor = Some(url.len())
++            self.cursor = Some(url.chars().count());
++            self.anchor = None;
+         }
+ 
+         self.url = Some(url.to_owned());
+@@ -188,6 +367,61 @@ impl Navigation {
+         ]
+     }
+ 
++    /// The URL field as elements, splitting out the selected range so it
++    /// renders highlighted (white on blue), like a focused text input.
++    fn render_url(&self, space: usize) -> Vec<NavigationElement> {
++        let background = Color::splat(255);
++        let foreground = Color::splat(0);
++        let sel_bg = Color {
++            r: 51,
++            g: 144,
++            b: 255,
++        };
++        let sel_fg = Color::splat(255);
++
++        let chars: Vec<char> = self.display_url().chars().take(space).collect();
++        let width: usize = chars.iter().collect::<String>().width();
++        let pad = " ".repeat(space.saturating_sub(width));
++
++        let mut spans: Vec<(String, bool)> = Vec::new();
++        match self.selection() {
++            None => spans.push((chars.iter().collect(), false)),
++            Some((start, end)) => {
++                let start = start.min(chars.len());
++                let end = end.min(chars.len());
++
++                spans.push((chars[..start].iter().collect(), false));
++                spans.push((chars[start..end].iter().collect(), true));
++                spans.push((chars[end..].iter().collect(), false));
++            }
++        }
++
++        let mut elements = vec![NavigationElement {
++            text: " ".to_owned(),
++            background,
++            foreground,
++        }];
++
++        for (text, selected) in spans {
++            if text.is_empty() {
++                continue;
++            }
++            elements.push(NavigationElement {
++                text,
++                background: if selected { sel_bg } else { background },
++                foreground: if selected { sel_fg } else { foreground },
++            });
++        }
++
++        elements.push(NavigationElement {
++            text: format!("{pad} "),
++            background,
++            foreground,
++        });
++
++        elements
++    }
++
+     pub fn render(&self, size: Size) -> Vec<(Point, NavigationElement)> {
+         let ui_elements = 13;
+         let space = if size.width >= ui_elements {
+@@ -195,27 +429,219 @@ impl Navigation {
+         } else {
+             0
+         };
+-        let url: String = self.display_url().chars().take(space).collect();
+-        let width = url.width();
+-        let padded = format!(" {}{} ", url, " ".repeat(space - width));
+         let mut elements = Vec::new();
+         let mut point = Point::splat(0);
+-
+-        for list in [
+-            self.render_btn("\u{276e}", self.can_go_back),
+-            self.render_btn("\u{276f}", self.can_go_forward),
+-            self.render_btn("↻", true),
+-            self.render_btn(&padded, true),
+-        ] {
++        let mut push = |list: Vec<NavigationElement>, point: &mut Point| {
+             for element in list {
+                 let width = element.text.width() as i32;
+ 
+                 elements.push((point.clone(), element));
+ 
+-                point = point + (width, 0);
++                *point = point.clone() + (width, 0);
+             }
+-        }
++        };
++
++        push(
++            self.render_btn("\u{276e}", self.can_go_back).into(),
++            &mut point,
++        );
++        push(
++            self.render_btn("\u{276f}", self.can_go_forward).into(),
++            &mut point,
++        );
++        push(self.render_btn("↻", true).into(), &mut point);
++        push(self.render_url(space), &mut point);
+ 
          elements
      }
  }
@@ -1328,7 +2140,107 @@ index 97d669b..3e6662f 100644
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::resolve_url;
++    use super::{resolve_url, Navigation};
++    use crate::input::Key;
++
++    fn nav_with(url: &str) -> Navigation {
++        let mut nav = Navigation::new();
++        nav.push(url, false, false);
++        nav
++    }
++
++    fn click(nav: &mut Navigation, x: i32) {
++        nav.mouse_down((x, 0).into());
++        nav.mouse_up((x, 0).into());
++    }
++
++    #[test]
++    fn click_focuses_and_selects_all() {
++        let mut nav = nav_with("https://example.com");
++
++        click(&mut nav, 15);
++        assert_eq!(nav.selected_text().as_deref(), Some("https://example.com"));
++    }
++
++    #[test]
++    fn second_click_places_caret() {
++        let mut nav = nav_with("https://example.com");
++
++        click(&mut nav, 15);
++        click(&mut nav, 13); // col 13 - 11 = char index 2
++        assert_eq!(nav.selected_text(), None);
++        assert_eq!(nav.cursor().map(|p| p.x), Some(13));
++    }
++
++    #[test]
++    fn typing_replaces_selection() {
++        let mut nav = nav_with("https://example.com");
++
++        click(&mut nav, 15); // select all
++        nav.keypress(&Key::from(b'x'));
++        assert_eq!(nav.display_url(), "x");
++    }
++
++    #[test]
++    fn drag_selects_range() {
++        let mut nav = nav_with("https://example.com");
++
++        click(&mut nav, 15); // focus
++        nav.mouse_down((11, 0).into());
++        nav.mouse_move((16, 0).into());
++        nav.mouse_up((16, 0).into());
++        assert_eq!(nav.selected_text().as_deref(), Some("https"));
++    }
++
++    #[test]
++    fn ctrl_a_selects_all_backspace_clears() {
++        let mut nav = nav_with("https://example.com");
++
++        click(&mut nav, 15);
++        click(&mut nav, 13);
++        nav.keypress(&Key::from(0x01));
++        nav.keypress(&Key::from(0x7f));
++        assert_eq!(nav.display_url(), "");
++    }
++
++    #[test]
++    fn control_chars_are_not_inserted() {
++        let mut nav = nav_with("abc");
++
++        click(&mut nav, 15);
++        click(&mut nav, 12);
++        nav.keypress(&Key::from(0x03));
++        nav.keypress(&Key::from(0x1b));
++        assert_eq!(nav.display_url(), "abc");
++    }
++
++    #[test]
++    fn paste_inserts_at_caret() {
++        let mut nav = nav_with("ac");
++
++        click(&mut nav, 15);
++        click(&mut nav, 12); // caret at char 1
++        assert!(nav.insert_text("b"));
++        assert_eq!(nav.display_url(), "abc");
++    }
++
++    #[test]
++    fn ctrl_o_opens_external_with_current_url() {
++        use super::NavigationAction;
++
++        let mut nav = nav_with("https://example.com");
++
++        // Unfocused and focused both hand off the displayed URL.
++        for _ in 0..2 {
++            match nav.keypress(&Key::from(0x0f)) {
++                NavigationAction::OpenExternal(url) => {
++                    assert_eq!(url, "https://example.com")
++                }
++                _ => panic!("expected OpenExternal"),
++            }
++            click(&mut nav, 15);
++        }
++    }
 +
 +    #[test]
 +    fn keeps_full_urls() {
@@ -1341,7 +2253,10 @@ index 97d669b..3e6662f 100644
 +    #[test]
 +    fn assumes_https_for_bare_hosts() {
 +        assert_eq!(resolve_url("youtube.com"), "https://youtube.com");
-+        assert_eq!(resolve_url("youtube.com/watch?v=1"), "https://youtube.com/watch?v=1");
++        assert_eq!(
++            resolve_url("youtube.com/watch?v=1"),
++            "https://youtube.com/watch?v=1"
++        );
 +        assert_eq!(resolve_url("localhost"), "https://localhost");
 +        assert_eq!(resolve_url("localhost:3000"), "https://localhost:3000");
 +        assert_eq!(resolve_url("  arxiv.org  "), "https://arxiv.org");

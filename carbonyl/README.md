@@ -19,6 +19,44 @@ patch adds a `--graphics` mode that:
 It also adds omnibox-style address-bar resolution: a bare host like
 `youtube.com` becomes `https://youtube.com`, and free text becomes a search.
 
+Frames are transmitted incrementally: each new framebuffer is diffed against
+the previous one — identical frames send nothing, small changes (a caret
+blink, a hover) go out as a kitty *frame edit* of just the changed rows, and
+zoom/pan re-send only the placement, no pixels. Full retransmits happen only
+on first paint, resize, or when most of the frame changed (e.g. scrolling).
+
+## Address bar
+
+A real text field, like a browser omnibox:
+
+| Action | How |
+|--------|-----|
+| focus + select whole URL | click the bar (type to replace it) |
+| place the caret | click again |
+| select a range | click-drag |
+| select all | `Ctrl+A` |
+| copy / paste selection | `Ctrl+C` / `Ctrl+V` (OSC 52) |
+| start / end | `Up` / `Down` |
+| navigate | `Enter` |
+
+## Passwords & real-browser handoff
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+L` | fill the page's login form from the system keyring |
+| `Ctrl+O` | open the current URL in the real VD Chromium |
+
+`Ctrl+L` looks up credentials stored with `ide-web-cred add <host>`
+(gnome-keyring via `secret-tool`, exact-host match only) and injects them over
+CDP with native setters + `input`/`change` events, so framework forms see real
+typing. It only ever runs on the explicit keypress — never on page load — and
+a look-alike domain never matches a stored host.
+
+`Ctrl+O` hands the URL to `$CARBONYL_OPEN_EXTERNAL_CMD` (default
+`ide-open desktop`): the real Chromium inside the Virtual Desktop, with a
+persistent profile (`/vdshare/chromium-profile`, `--password-store=basic`) —
+full password manager, autofill, extensions, OAuth popups, passkeys.
+
 ## Zoom & pan (graphics mode)
 
 Small text? The graphics view doubles as a magnifier — it shows a cropped
@@ -71,7 +109,8 @@ The patch is **not vendored** here — it's a fork with upstream PRs:
 - Address-bar omnibox → [fathyb/carbonyl#222](https://github.com/fathyb/carbonyl/pull/222)
 
 [`kitty-ide-carbonyl.patch`](kitty-ide-carbonyl.patch) is the combined diff
-(graphics + aspect fix + omnibox + zoom/pan + clipboard) for reference.
+(graphics + incremental frames + aspect fix + omnibox + URL-bar text field +
+zoom/pan + clipboard + keyring autofill + VD handoff) for reference.
 
 ## Building / installing
 
@@ -82,9 +121,9 @@ Only the Rust core needs building — the prebuilt Chromium runtime dlopens it, 
 git clone https://github.com/rsirjani/carbonyl ~/src/carbonyl
 cd ~/src/carbonyl
 git checkout local-ide        # graphics + aspect + omnibox merged
-cargo build                   # ~seconds
+cargo build --release         # ~seconds; release matters — the blit path is hot
 # drop the rebuilt core into a release carbonyl:
-cp build/debug/libcarbonyl.so \
+cp build/release/libcarbonyl.so \
    "$(npm root -g)/carbonyl/node_modules/@fathyb/carbonyl-linux-amd64/build/libcarbonyl.so"
 ```
 

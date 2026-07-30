@@ -240,7 +240,8 @@ case "$cmd" in
     e="$(need_active)"; s="$(provider_script "$e")"
     "$s" launch "$(env_path "$e")" chromium \
       --no-sandbox --disable-gpu --no-first-run --start-maximized \
-      --user-data-dir=/vdshare/chromium-profile "$1"
+      --user-data-dir=/vdshare/chromium-profile \
+      --password-store=basic "$1"
     ;;
 
   run|launch|gl)
