@@ -128,17 +128,61 @@ up() {
     echo $! > "$RUN/webdav-ts.pid"
   fi
 
+  # iOS Files' "Connect to Server" speaks SMB ONLY — it has never supported
+  # WebDAV; any http(s):// there errors "URL not supported" (the WebDAV stays
+  # for Safari and non-Apple clients). Read-only guest SMB share of the same
+  # tree, bound strictly to the tailnet + PAN addresses.
+  if command -v smbd >/dev/null && [ -n "$ts_ip" ] && ! alive smbd; then
+    local smbdir="$RUN/samba"
+    mkdir -p "$smbdir"
+    cat > "$RUN/smb.conf" <<EOF
+[global]
+  server role = standalone server
+  map to guest = Bad User
+  bind interfaces only = yes
+  # samba refuses to bind point-to-point interfaces (tailscale0) in any
+  # form, so it listens on loopback and \`tailscale serve\` proxies tailnet
+  # port 445 here (see below).
+  interfaces = lo $BRIDGE
+  server min protocol = SMB2
+  load printers = no
+  disable spoolss = yes
+  pid directory = $smbdir
+  lock directory = $smbdir
+  state directory = $smbdir
+  cache directory = $smbdir
+  private dir = $smbdir
+  ncalrpc dir = $smbdir/ncalrpc
+  log file = $smbdir/smb.log
+  max log size = 100
+[projects]
+  path = $SHARE_DIR
+  read only = yes
+  guest ok = yes
+  force user = $USER
+EOF
+    sudo smbd --configfile="$RUN/smb.conf" -D
+    cp "$smbdir/smbd.pid" "$RUN/smbd.pid" 2>/dev/null || true
+    # Expose the loopback smbd on the tailnet via the tailscale daemon.
+    sudo tailscale serve --bg --tcp 445 tcp://127.0.0.1:445 >/dev/null
+  fi
+
   adapter_set Discoverable true >/dev/null
   echo "up: PAN '$BRIDGE' at $ADDR, WebDAV http://$ADDR:$WEBDAV_PORT ($SHARE_DIR, read-only)"
-  [ -n "$ts_url" ] && echo "    tailnet WebDAV $ts_url (iPad: Tailscale app + Safari/Files)"
-  echo "    Files login — user: $dav_user  password: $dav_pass"
+  [ -n "$ts_url" ] && echo "    tailnet WebDAV $ts_url (Safari)"
+  echo "    WebDAV login — user: $dav_user  password: $dav_pass"
+  [ -n "$ts_ip" ] && command -v smbd >/dev/null && \
+    echo "    Files app: Connect to Server -> smb://$ts_ip -> Guest -> projects"
 }
 
 down() {
   for w in webdav webdav-ts; do
     [ -f "$RUN/$w.pid" ] && { kill "$(cat "$RUN/$w.pid")" 2>/dev/null || true; rm -f "$RUN/$w.pid"; }
   done
-  [ -f "$RUN/dnsmasq.pid" ] && { sudo kill "$(cat "$RUN/dnsmasq.pid")" 2>/dev/null || true; rm -f "$RUN/dnsmasq.pid"; }
+  for r in dnsmasq smbd; do
+    [ -f "$RUN/$r.pid" ] && { sudo kill "$(cat "$RUN/$r.pid")" 2>/dev/null || true; rm -f "$RUN/$r.pid"; }
+  done
+  sudo tailscale serve --tcp 445 off 2>/dev/null || true
   nap_unregister
   ip link show "$BRIDGE" >/dev/null 2>&1 && sudo ip link del "$BRIDGE"
   adapter_set Discoverable false >/dev/null 2>&1 || true
@@ -147,7 +191,7 @@ down() {
 
 status() {
   ip -br addr show "$BRIDGE" 2>/dev/null || echo "$BRIDGE: absent"
-  for p in dnsmasq webdav webdav-ts; do
+  for p in dnsmasq webdav webdav-ts smbd; do
     if alive "$p"; then
       echo "$p: running (pid $(cat "$RUN/$p.pid"))"
     else
