@@ -100,18 +100,37 @@ up() {
   # computers (both directions — verified 2026-07-30), but Tailscale rides
   # outbound internet, which client-isolated WiFi still allows. The tailnet
   # is private to the user's devices; still read-only.
+  # iOS Files also refuses plain-HTTP WebDAV ("URL not supported" — App
+  # Transport Security; Safari is exempt). Serve HTTPS with the tailnet's
+  # Let's Encrypt cert when present — iPads trust it out of the box:
+  #   sudo tailscale cert --cert-file ~/.config/ide-pad/tls.crt \
+  #        --key-file ~/.config/ide-pad/tls.key <host>.<tailnet>.ts.net
   ts_ip=$(tailscale ip -4 2>/dev/null | head -1 || true)
+  local crt="$HOME/.config/ide-pad/tls.crt" key="$HOME/.config/ide-pad/tls.key"
+  local ts_url="" tls_args=()
+  if [ -n "$ts_ip" ]; then
+    local ts_name
+    ts_name=$(tailscale status --json 2>/dev/null \
+      | sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/\1/p' | head -1)
+    if [ -f "$crt" ] && [ -f "$key" ] && [ -n "$ts_name" ]; then
+      tls_args=(--cert "$crt" --key "$key")
+      ts_url="https://$ts_name:$WEBDAV_PORT"
+    else
+      ts_url="http://$ts_ip:$WEBDAV_PORT"
+    fi
+  fi
   if [ -n "$ts_ip" ] && ! alive webdav-ts; then
     nohup rclone serve webdav "$SHARE_DIR" \
       --addr "$ts_ip:$WEBDAV_PORT" --read-only \
       --user "$dav_user" --pass "$dav_pass" \
+      "${tls_args[@]}" \
       >"$RUN/webdav-ts.log" 2>&1 &
     echo $! > "$RUN/webdav-ts.pid"
   fi
 
   adapter_set Discoverable true >/dev/null
   echo "up: PAN '$BRIDGE' at $ADDR, WebDAV http://$ADDR:$WEBDAV_PORT ($SHARE_DIR, read-only)"
-  [ -n "$ts_ip" ] && echo "    tailnet WebDAV http://$ts_ip:$WEBDAV_PORT (iPad: Tailscale app + Safari/Files)"
+  [ -n "$ts_url" ] && echo "    tailnet WebDAV $ts_url (iPad: Tailscale app + Safari/Files)"
   echo "    Files login — user: $dav_user  password: $dav_pass"
 }
 
