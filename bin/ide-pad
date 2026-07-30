@@ -81,13 +81,28 @@ up() {
     echo $! > "$RUN/webdav.pid"
   fi
 
+  # Second instance on the tailnet, when tailscale is up. This is the route
+  # that actually works for the iPad: iOS refuses Bluetooth PAN with
+  # computers (both directions — verified 2026-07-30), but Tailscale rides
+  # outbound internet, which client-isolated WiFi still allows. The tailnet
+  # is private to the user's devices; still read-only.
+  ts_ip=$(tailscale ip -4 2>/dev/null | head -1 || true)
+  if [ -n "$ts_ip" ] && ! alive webdav-ts; then
+    nohup rclone serve webdav "$SHARE_DIR" \
+      --addr "$ts_ip:$WEBDAV_PORT" --read-only \
+      >"$RUN/webdav-ts.log" 2>&1 &
+    echo $! > "$RUN/webdav-ts.pid"
+  fi
+
   adapter_set Discoverable true >/dev/null
   echo "up: PAN '$BRIDGE' at $ADDR, WebDAV http://$ADDR:$WEBDAV_PORT ($SHARE_DIR, read-only)"
-  echo "iPad: Settings > Bluetooth > tap this laptop, then Files/Safari > http://$ADDR:$WEBDAV_PORT"
+  [ -n "$ts_ip" ] && echo "    tailnet WebDAV http://$ts_ip:$WEBDAV_PORT (iPad: Tailscale app + Safari/Files)"
 }
 
 down() {
-  [ -f "$RUN/webdav.pid" ] && { kill "$(cat "$RUN/webdav.pid")" 2>/dev/null || true; rm -f "$RUN/webdav.pid"; }
+  for w in webdav webdav-ts; do
+    [ -f "$RUN/$w.pid" ] && { kill "$(cat "$RUN/$w.pid")" 2>/dev/null || true; rm -f "$RUN/$w.pid"; }
+  done
   [ -f "$RUN/dnsmasq.pid" ] && { sudo kill "$(cat "$RUN/dnsmasq.pid")" 2>/dev/null || true; rm -f "$RUN/dnsmasq.pid"; }
   nap_unregister
   ip link show "$BRIDGE" >/dev/null 2>&1 && sudo ip link del "$BRIDGE"
@@ -97,7 +112,7 @@ down() {
 
 status() {
   ip -br addr show "$BRIDGE" 2>/dev/null || echo "$BRIDGE: absent"
-  for p in dnsmasq webdav; do
+  for p in dnsmasq webdav webdav-ts; do
     if alive "$p"; then
       echo "$p: running (pid $(cat "$RUN/$p.pid"))"
     else
