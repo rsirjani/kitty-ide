@@ -6,10 +6,33 @@
 # vanish. Instead we render with glow and page the result through `less` ourselves
 # -- which reliably stays open. Press q to close the tab; Alt+M (or the tab-bar ⇄)
 # morphs to nvim for editing.
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 file="$1"
 [ -n "$file" ] || exit 0
 cols=$(tput cols 2>/dev/null || echo 100)
+
+# Prefer a real KaTeX render in Carbonyl. This supports the full notation used
+# in mathematical Markdown (including \mathcal, \operatorname, fractions,
+# aligned scripts, and accessible MathML) instead of approximating it as text.
+renderer="$(dirname "$(readlink -f "$0")")/ide-render-md.js"
+if command -v node >/dev/null 2>&1 && command -v carbonyl >/dev/null 2>&1 \
+   && [ -r "$renderer" ]; then
+  . ide-sock 2>/dev/null || true
+  html_dir="/tmp/ide-${IDE_ID:-default}-render"
+  mkdir -p "$html_dir"
+  key="$(printf '%s|%s' "$(readlink -f -- "$file")" \
+    "$(stat -c %Y -- "$file" 2>/dev/null || echo 0)" | md5sum | cut -d' ' -f1)"
+  html="$html_dir/md-$key.html"
+  if node "$renderer" "$file" "$html" && [ -s "$html" ]; then
+    exec carbonyl --graphics --user-data-dir="$html_dir/chromium-$$" "file://$html"
+  fi
+fi
+
+# mdterm provides partial LaTeX-to-Unicode conversion when the HTML renderer is
+# unavailable. glow remains the final, widely available fallback below.
+if command -v mdterm >/dev/null 2>&1; then
+  exec mdterm --theme dark --width "$cols" "$file"
+fi
 
 # Cache glow's rendered output keyed by abspath+mtime+width, so re-opening the
 # same (unchanged) markdown is instant instead of re-rendering each time. The

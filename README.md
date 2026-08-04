@@ -17,7 +17,7 @@ pixel-perfect inside the terminal).
 │ ── tab bar (fixed 1 row) ────────│  shell /       │
 │                                  │  claude        │
 │   editor / reader / browser      │  session       │
-│ (nvim·glow·tdf·mpv·visidata·web) │                │
+│ (nvim·KaTeX·tdf·mpv·visidata·web)│                │
 └──────────────────────────────────┴────────────────┘
 ```
 
@@ -38,7 +38,9 @@ scripts.
   as a tab in the editor zone. Click a tab to switch, click its `×` to close,
   click `+ web` to open a browser. Keyboard too.
 - **Opens any file in the right viewer** — one dispatcher (`ide-open`) detects
-  the type and renders it in a tab: **markdown** via [glow](https://github.com/charmbracelet/glow),
+  the type and renders it in a tab: **markdown** as local HTML with
+  [KaTeX](https://katex.org/) math inside Carbonyl (`mdterm`, then `glow`, are
+  automatic fallbacks),
   **HTML** in a web tab, **images** via kitty `icat`, **video/audio** via `mpv`
   (kitty graphics), **CSV / XLSX** as editable tables in [VisiData](https://www.visidata.org/),
   **docx / pptx / xlsx** as a crisp PDF render (LibreOffice → tdf), **PDF** via

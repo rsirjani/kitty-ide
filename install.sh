@@ -47,6 +47,17 @@ else
   echo "   all present (glow, mpv, visidata, libreoffice)"
 fi
 
+# Full local Markdown math rendering. ide-view-md uses these packages to render
+# GFM + KaTeX into a local HTML page, then displays it through Carbonyl. mdterm
+# and glow remain runtime fallbacks if Node or Carbonyl is unavailable.
+if command -v npm >/dev/null; then
+  npm install --silent --prefix "$HOME/.local/share/kitty-ide-markdown" \
+    marked marked-katex-extension katex \
+    || echo "   (Markdown math packages failed — mdterm/glow fallback remains available)"
+else
+  echo "   npm not found — Markdown math disabled; mdterm/glow fallback remains available"
+fi
+
 echo "==> virtual desktop (ide-vd)"
 # python venv for the VNC feed + Claude's eyes/hands (kept out of system python)
 VENV="$HOME/.local/share/ide-vd/venv"
@@ -100,7 +111,7 @@ Done. Launch the IDE with:  ide
 Notes:
  - ide.session has machine-specific paths (~/projects); adjust for your setup.
  - The crisp browser needs a patched carbonyl on PATH — see carbonyl/README.md.
- - The editor pane renders by type: markdown→glow, html→web tab, images→icat,
+ - The editor pane renders by type: markdown→KaTeX/Carbonyl, html→web tab, images→icat,
    video/audio→mpv, csv/xlsx→visidata, docx/pptx→LibreOffice PDF, pdf→tdf, else
    nvim. Press Alt+M (or click the tab-bar ⇄) to morph rendered⇄editable.
  - PDF tabs use `tdf`; editing uses `nvim`.
