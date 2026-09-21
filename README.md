@@ -61,6 +61,12 @@ scripts.
   title of the current chat (Claude Code's AI-generated session summary), so with
   many workspaces you can tell at a glance what each is working on. The same
   title also replaces the static "IDE" label in Waybar for the focused window.
+- **Select-to-delete in the claude chat** — highlight text in Claude Code's
+  input box with the mouse and press backspace/delete to remove it, like a GUI
+  editor. A kitten walks the (hidden but caret-tracking) terminal cursor
+  through the selection with verified arrow presses, then backspaces it; the
+  prompt, chat history and padding are unreachable so only real input text
+  ever dies. No selection = the key behaves normally.
 - **Explorer-following terminal** — as you browse directories in the explorer,
   the terminal silently `cd`s to match — but only when it's idle (never typing
   into a running claude session or command).

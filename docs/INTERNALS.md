@@ -70,6 +70,37 @@ workspaces you can tell at a glance what each one's Claude is doing. The pieces:
   the header. Pane var values are kept non-overlapping; matches that must target
   only the shell anchor it (`var:pane=claude$`).
 
+## Select-to-delete in the claude pane (`ide-seldel.py`)
+
+Claude Code's input editor is keyboard-only — a kitty mouse selection is
+invisible to it. `ide-seldel.py` (a `no_ui` kitten, mapped in `ide.conf` to
+`backspace`/`delete` with `--when-focus-on var:pane=claude`) bridges the two,
+so highlighting text in the input box and hitting backspace deletes it. With
+no selection the key passes straight through (`window.send_key` respects the
+app's keyboard-protocol mode), so normal typing is untouched.
+
+How it can work at all: kitty knows the selected screen cells
+(`screen.current_selections()` — note the bitmap carries an extra top row vs
+cursor/`as_text` coordinates, hence the `row_off` correction), and Claude Code
+keeps the *real* terminal cursor parked on the input caret (hidden with
+`?25l`, but positioned — an IME affordance). The kitten walks the caret to the
+selection start with arrow keys, walks right through the selection counting
+actual keypresses, then sends that many backspaces. Every batch is verified
+against the live cursor on a timer (`add_timer`; decisions only on frames
+where the cursor has been stable a few ticks), and batch sizes come from the
+screen text itself via a wcwidth cluster map, so wide chars cost one press.
+Row crossings are ambiguous (soft wrap = 0 presses, real newline = 1), so they
+are probed one press at a time and counted only if the cursor moved.
+
+The walk is self-limiting, which is the safety story: anything the caret
+cannot reach — chat history above the input, the `❯ ` prompt, blank padding —
+makes an arrow press move nothing, which reads as a boundary. So the deletion
+is exactly the intersection of the selection with the editable text, and a
+selection entirely outside the input deletes nothing (the caret is walked back
+to where it started). Wrong deletions are undoable with Claude Code's input
+undo (`ctrl+_`). It also works on the bare zsh prompt in the same pane, since
+zle has the same arrow/backspace semantics.
+
 ## Waybar window title → chat title
 
 Waybar's `hyprland/window` module shows `{title}`, which for the IDE was the
