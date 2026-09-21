@@ -50,7 +50,9 @@ STABLE_TICKS = 2      # cursor unchanged this long => frame settled, safe to act
 STALL_TICKS = 15      # a sent press moved nothing for this long => boundary
 MAX_TOTAL_TICKS = 1100 # ~9s hard stop for the whole operation
 MAX_PRESSES = 4000    # absolute cap on synthesized keypresses
-JUMP_SETTLE_TICKS = 90 # one-shot burst never reached its landing => walk it
+JUMP_REST_TICKS = 6   # cursor still this long after a burst => claude is done
+JUMP_SETTLE_TICKS = 90 # one-shot burst never came to rest => walk it
+MAX_JUMP_CORRECTIONS = 2  # corrective bursts before giving up on the one-shot
 
 active = set()  # window ids with an operation in flight
 DEBUG = False
@@ -228,14 +230,18 @@ def plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol=TEXT_COL):
 
 
 class SelDel:
-    def __init__(self, boss, window_id, sel_first, sel_last, orig, plan=None):
+    def __init__(self, boss, window_id, sel_first, sel_last, orig, plan=None, tcol=TEXT_COL):
         self.boss = boss
         self.wid = window_id
         self.sel_first = sel_first  # (y, x) first selected cell, row-major
         self.sel_last = sel_last    # (y, x) last selected cell
         self.orig = orig            # caret position before we touched anything
         self.plan = plan            # precomputed one-shot, or None
+        self.tcol = tcol            # first editable column of a wrapped row
         self.jump_sent = False
+        self.jump_from = None
+        self.expect_move = False
+        self.corrections = 0
         self.settle = 0
         self.phase = 'jump' if plan else 'to_start'
         self.count = 0              # confirmed presses across the selection
@@ -345,26 +351,60 @@ class SelDel:
     # -- phases ---------------------------------------------------------
 
     def jump(self, w, pos):
+        """Send the arrow burst, wait for the caret to come to rest, then check
+        where it rests. Resting position — not any position seen in passing —
+        is what matters: Claude coalesces repaints, so a long burst often shows
+        the caret jumping several cells at a time and the predicted cell may
+        never be rendered at all. (Watching for it tick by tick is what made
+        the first, longest jump of a session fall through to the walker.)"""
         key, n, lands, n_del = self.plan
+        if not self.jump_sent:
+            self.jump_sent = True
+            self.jump_from = pos
+            self.last_pos = pos
+            self.settle = self.stable = 0
+            self.expect_move = n > 0 and self.send(w, key, n)
+            if self.expect_move:
+                return False
+        if pos != self.last_pos:
+            self.last_pos = pos
+            self.stable = 0
+        else:
+            self.stable += 1
+        self.settle += 1
+        if self.settle > JUMP_SETTLE_TICKS:
+            self.fall_back()  # never came to rest: hand it to the walker
+            return False
+        if self.stable < JUMP_REST_TICKS or (self.expect_move and pos == self.jump_from):
+            # Claude renders a long burst in chunks and can pause between them,
+            # so "unchanged for a couple of polls" is not yet "arrived"
+            return False
         if pos in lands:
-            # the caret is exactly where the press arithmetic predicted: the
-            # counts are validated, fire the whole deletion in one write
+            # the caret came to rest exactly where the press arithmetic said it
+            # would: the counts are validated, delete in one write
             w.screen.clear_selection()
             self.send(w, 'backspace', n_del)
             return True
-        if self.jump_sent:
-            # in flight: the burst is a monotonic sweep toward the landing, so
-            # the only cell it can pass through mid-way is the landing itself
-            self.settle += 1
-            if self.settle > JUMP_SETTLE_TICKS:
-                self.fall_back()  # never arrived: plan was wrong, walk it
+        # It stopped somewhere else, so some assumption was off. The distance
+        # left is measurable now, so try closing it — a miscount of one or two
+        # presses is far likelier than the whole model being wrong, and one
+        # more burst is still invisible next to the walker's crawl.
+        if self.corrections >= MAX_JUMP_CORRECTIONS:
+            self.fall_back()
             return False
+        target = lands[0]
+        rows = self.rows(w)
+        if pos > target:
+            key, n = 'left', presses_over(rows, w.screen.columns, target, pos, self.tcol)
+        else:
+            key, n = 'right', presses_over(rows, w.screen.columns, pos, target, self.tcol)
         if n <= 0:
             self.fall_back()
             return False
-        self.jump_sent = True
-        self.settle = 0
-        return not self.send(w, key, n)
+        self.corrections += 1
+        self.jump_sent = False
+        self.plan = (key, n, lands, n_del)
+        return False
 
     def fall_back(self):
         self.phase = 'to_start'
@@ -532,7 +572,7 @@ def handle_result(args, answer, target_window_id, boss):
     if try_fast_path(w, sel_first, sel_last):
         return
     plan = plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol)
-    machine = SelDel(boss, target_window_id, sel_first, sel_last, cur, plan)
+    machine = SelDel(boss, target_window_id, sel_first, sel_last, cur, plan, tcol)
     active.add(target_window_id)
     add_timer(machine, 0, False)
 

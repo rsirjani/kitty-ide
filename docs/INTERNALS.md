@@ -110,11 +110,21 @@ Deletion is always expressed as backspaces, never forward-delete: zsh takes
 `CSI 3~` apart and inserts a literal `~` per press, while backspace is
 understood by every line editor and is a no-op at column 0.
 
+The landing check waits for the caret to come to *rest* — unchanged for
+several polls — and only then compares it to the prediction. Claude coalesces
+repaints, so during a long burst the caret is rendered jumping several cells
+at a time and may never be drawn on the predicted cell at all; watching for it
+poll by poll is what used to make the first, longest jump of a session fall
+through to the walker and crawl. If the resting place is wrong, the remaining
+distance is now measurable, so the kitten fires a corrective burst (up to two)
+before giving up — a miscount of a press or two is far likelier than the whole
+model being wrong.
+
 Safety comes from the arithmetic being checked rather than trusted. The
-backspaces go out only once the caret has landed exactly where the count
-predicted; if it lands anywhere else, the kitten falls back to the original
-walker, which inches the caret along in verified batches and stalls at
-whatever it cannot cross (the prompt, padding, the transcript) instead of
+backspaces go out only once the caret has come to rest exactly where the count
+predicted; if corrections can't get it there, the kitten falls back to the
+original walker, which inches the caret along in verified batches and stalls
+at whatever it cannot cross (the prompt, padding, the transcript) instead of
 deleting past it. Wrong deletions remain undoable with Claude Code's input
 undo (`ctrl+_`).
 
