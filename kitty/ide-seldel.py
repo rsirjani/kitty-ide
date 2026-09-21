@@ -11,29 +11,37 @@
 #
 #   1. no selection → pass the key straight through (send_key respects the
 #      window's keyboard-protocol mode, so this is transparent).
-#   2. selection → walk the caret to the selection start with arrow keys,
-#      verifying against the live cursor position after every batch; then
-#      walk right through the selection *counting actual keypresses*; then
-#      send that many backspaces in one write.
+#   2. clip the selection to the editable block — Claude's input box, or the
+#      caret's logical line at a bare shell prompt. A selection that misses
+#      it entirely (the transcript, the status lines) is simply dropped.
+#   3. selection on the caret's own row → blind one-shot: arrows + backspaces
+#      in a single write, no timer at all.
+#   4. otherwise → verified one-shot: ONE arrow burst to just past the end of
+#      the selection, ONE landing check against the live cursor, ONE burst of
+#      backspaces. Two writes, no visible caret crawl.
+#   5. only when that landing check fails does the slow walker run: the caret
+#      is walked batch by batch, each step verified against the live cursor,
+#      counting the presses it actually takes to cross the selection, then
+#      that many backspaces.
 #
-# The walk is self-limiting: anything the caret cannot reach — chat history
-# above the input, the "❯ " prompt, blank padding, status lines below — makes
-# an arrow press move nothing, which reads as a boundary. So what gets
-# deleted is exactly the intersection of the selection with the editable
-# text, and a selection entirely outside the input deletes nothing (the
-# caret is walked back to where it started). Wrong deletions are undoable
-# with Claude Code's input undo (ctrl+_).
+# Everything is counted from the screen text: rows are split into grapheme-ish
+# clusters (wcwidth; zero-width chars attach to the previous cell) so a wide
+# char costs one press, not two, and each row boundary costs one press only
+# when the row stopped short of the screen edge — a row filled to the edge
+# wrapped mid-text and its end is adjacent to the next row's start.
 #
-# Batches are sized from the screen text itself: each row is split into
-# grapheme-ish clusters (wcwidth; zero-width chars attach to the previous
-# cell) so wide chars cost one press, not two. Row crossings are ambiguous
-# (soft wrap = 0 presses, real newline = 1), so they are probed one press at
-# a time and counted only if the cursor actually moved. Decisions are only
-# taken once the cursor has been stable for a few ticks, so a half-painted
-# frame is never mistaken for a caret position.
+# Safety comes from the arithmetic being checkable rather than trusted: the
+# backspaces only go out once the caret has landed exactly where the count
+# predicted. Anything unreachable by the caret — chat history, the "❯ "
+# prompt, padding, status lines — either gets clipped away in step 2 or makes
+# the landing check fail, which means a walk, and a walk stalls at the
+# boundary rather than deleting past it. Wrong deletions remain undoable with
+# Claude Code's input undo (ctrl+_).
 #
-# Also works on the bare zsh prompt in the same pane (zle has the same
-# arrow/backspace semantics).
+# Also works on the bare zsh prompt in the same pane (zle has the same arrow
+# and backspace semantics). Deletion is always expressed as backspaces, never
+# forward-delete: zsh here takes `CSI 3~` apart and inserts a literal `~` per
+# press, while backspace is understood everywhere and is a no-op at column 0.
 
 from kitty.fast_data_types import add_timer, wcwidth
 
@@ -42,6 +50,7 @@ STABLE_TICKS = 2      # cursor unchanged this long => frame settled, safe to act
 STALL_TICKS = 15      # a sent press moved nothing for this long => boundary
 MAX_TOTAL_TICKS = 1100 # ~9s hard stop for the whole operation
 MAX_PRESSES = 4000    # absolute cap on synthesized keypresses
+JUMP_SETTLE_TICKS = 90 # one-shot burst never reached its landing => walk it
 
 active = set()  # window ids with an operation in flight
 DEBUG = False
@@ -75,14 +84,160 @@ def snap_to_cluster(text, cell):
     return None
 
 
+def row_len_cells(text):
+    return sum(cw for _, cw in clusters(text))
+
+
+def visual_rows(w):
+    """The screen as one string per *visual* row, matching cursor coordinates.
+    Plain `as_text()` merges a soft-wrapped line back into one logical line, so
+    its indices drift from the cursor's row the moment anything wraps (a zsh
+    command line, or a token too long to break in Claude's input). The wrap
+    markers say exactly where the screen broke each line."""
+    text = w.as_text(add_wrap_markers=True).replace('\r\n', '\n')
+    out = []
+    for line in text.split('\n'):
+        out.extend(line.split('\r'))
+    return out
+
+
+TEXT_COL = 2  # input rows start text at cell 2: "❯ " on the first, indent after
+PROMPT = '❯'  # Claude Code's input marker, first cell of the input's first row
+
+
+def input_rows(rows, cy):
+    """(first, last) screen rows of Claude Code's input box, or None if the
+    pane isn't showing one (a bare shell, say). The box is the `❯ ` row at or
+    above the caret plus the two-space-indented continuation rows under it,
+    stopping at the box rule (`───…`). Knowing where the editable text ends
+    keeps selections that spill into the rule, the status lines or the
+    transcript from being walked at all."""
+    top = None
+    for r in range(min(cy, len(rows) - 1), -1, -1):
+        row = rows[r]
+        if row[:1] == PROMPT:
+            top = r
+            break
+        if not row.startswith('  '):
+            return None  # ran out of input-shaped rows before finding a prompt
+    if top is None:
+        return None
+    bot = top
+    for r in range(top + 1, len(rows)):
+        row = rows[r]
+        if row[:1] == '─' or row[:1] == PROMPT:
+            break
+        if row.startswith('  '):
+            bot = r
+        elif row.strip():
+            break  # a non-indented, non-empty row: out of the box
+    return top, bot
+
+
+def boundary_cost(rows, r, cols):
+    """Caret presses to step off the end of row `r` onto the next row. A row
+    filled to the screen edge wrapped mid-text: its last cell and the next
+    row's first cell are adjacent positions, so the step is free. A row that
+    stops short broke at something real — the space a word wrap swallowed, or
+    a newline — and that character costs one press."""
+    row = rows[r] if 0 <= r < len(rows) else ''
+    return 0 if row_len_cells(row) >= cols else 1
+
+
+def logical_run(rows, cols, cy):
+    """(first, last) visual rows of the logical line the caret is on, found by
+    following full-width rows outward — a row filled to the screen edge wrapped
+    into the next one. Used when there's no Claude input box (a bare shell), so
+    a selection in the scrollback is rejected outright instead of being walked
+    into a dead end."""
+    top = cy
+    while top > 0 and row_len_cells(rows[top - 1]) >= cols:
+        top -= 1
+    bot = cy
+    while bot + 1 < len(rows) and row_len_cells(rows[bot]) >= cols:
+        bot += 1
+    return top, bot
+
+
+def presses_over(rows, cols, pfrom, pto, tcol):
+    """Caret presses to travel pfrom -> pto (row-major order, pfrom <= pto):
+    the characters passed on each row, plus each row boundary crossed."""
+    (ay, ax), (by, bx) = pfrom, pto
+    n = 0
+    for r in range(ay, by + 1):
+        row = rows[r] if 0 <= r < len(rows) else ''
+        rl = row_len_cells(row)
+        a = max(ax if r == ay else tcol, tcol)
+        b = min(bx if r == by else rl, rl)
+        if b > a:
+            n += presses_between(row, a, b)
+        if r < by:
+            n += boundary_cost(rows, r, cols)
+    return n
+
+
+def plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol=TEXT_COL):
+    """Precompute the whole edit as (arrow_key, n_arrows, landings, n_del):
+    one arrow burst to just past the end of the selection, a landing check,
+    one burst of backspaces. The landing check is the safety valve — the
+    backspaces only go out if the caret arrived exactly where the press
+    arithmetic predicted, so a wrong assumption (an unreachable selection, an
+    editor that moves the caret its own way) degrades to the slow-but-verified
+    walker rather than to a wrong deletion.
+
+    Everything is expressed as backspaces on purpose: forward-delete is not
+    universally understood — zsh here takes `CSI 3~` apart and inserts a
+    literal `~` per press — while backspace works in every line editor, and
+    backspacing at position 0 is a harmless no-op."""
+    (sr, sx), (er, ex) = sel_first, sel_last
+    segs = []
+    for r in range(sr, er + 1):
+        row = rows[r] if 0 <= r < len(rows) else ''
+        rl = row_len_cells(row)
+        a = max(sx if r == sr else tcol, tcol)
+        b = min(ex + 1 if r == er else rl, rl)
+        n = 0
+        if b > a:
+            s1 = snap_to_cluster(row, a)
+            if s1 is not None:
+                a = s1[0]
+            s2 = snap_to_cluster(row, b - 1)
+            if s2 is not None:
+                b = s2[1] + 1
+            n = presses_between(row, a, b)
+        segs.append((r, a, b, n))
+    live = [s for s in segs if s[3] > 0]
+    if not live:
+        return None
+    fr, fa = live[0][0], live[0][1]
+    lr, lb = live[-1][0], live[-1][2]
+    n_del = sum(s[3] for s in live) + sum(
+        boundary_cost(rows, r, cols) for r in range(fr, lr))
+    end = (lr, lb)  # the position just past the last selected character
+    lr_len = row_len_cells(rows[lr]) if 0 <= lr < len(rows) else 0
+    # a position at a row's end can render as the next row's start
+    end_alt = (lr + 1, tcol) if lb >= lr_len else None
+    lands = (end,) + ((end_alt,) if end_alt is not None else ())
+    # The caret is used exactly as rendered — no guessing about which side of a
+    # wrap it "really" sits on. A wrong guess would inflate the arrow count
+    # (e.g. onto a UI row above the input) and the burst would overshoot; an
+    # ambiguous-but-honest position just fails the landing check instead.
+    if cur >= end:
+        return ('left', presses_over(rows, cols, end, cur, tcol), lands, n_del)
+    return ('right', presses_over(rows, cols, cur, end, tcol), lands, n_del)
+
+
 class SelDel:
-    def __init__(self, boss, window_id, sel_first, sel_last, orig):
+    def __init__(self, boss, window_id, sel_first, sel_last, orig, plan=None):
         self.boss = boss
         self.wid = window_id
         self.sel_first = sel_first  # (y, x) first selected cell, row-major
         self.sel_last = sel_last    # (y, x) last selected cell
         self.orig = orig            # caret position before we touched anything
-        self.phase = 'to_start'
+        self.plan = plan            # precomputed one-shot, or None
+        self.jump_sent = False
+        self.settle = 0
+        self.phase = 'jump' if plan else 'to_start'
         self.count = 0              # confirmed presses across the selection
         self.pending = 0            # presses sent, counted only once movement is seen
         self.sent = 0
@@ -111,7 +266,7 @@ class SelDel:
         return self.boss.window_id_map.get(self.wid)
 
     def rows(self, w):
-        return w.as_text().split('\n')
+        return visual_rows(w)
 
     def send(self, w, key, n):
         n = min(n, MAX_PRESSES - self.sent)
@@ -133,6 +288,12 @@ class SelDel:
         if w is None or self.ticks > MAX_TOTAL_TICKS or self.sent >= MAX_PRESSES:
             return True
         pos = (w.screen.cursor.y, w.screen.cursor.x)
+
+        if self.phase == 'jump':
+            # checked every tick, not just on settled frames: the caret sweeps
+            # through many positions while claude digests the burst, and a
+            # momentary pause mid-sweep must not be mistaken for the landing
+            return self.jump(w, pos)
 
         if self.await_from is not None:
             if pos != self.await_from:
@@ -182,6 +343,34 @@ class SelDel:
         return True
 
     # -- phases ---------------------------------------------------------
+
+    def jump(self, w, pos):
+        key, n, lands, n_del = self.plan
+        if pos in lands:
+            # the caret is exactly where the press arithmetic predicted: the
+            # counts are validated, fire the whole deletion in one write
+            w.screen.clear_selection()
+            self.send(w, 'backspace', n_del)
+            return True
+        if self.jump_sent:
+            # in flight: the burst is a monotonic sweep toward the landing, so
+            # the only cell it can pass through mid-way is the landing itself
+            self.settle += 1
+            if self.settle > JUMP_SETTLE_TICKS:
+                self.fall_back()  # never arrived: plan was wrong, walk it
+            return False
+        if n <= 0:
+            self.fall_back()
+            return False
+        self.jump_sent = True
+        self.settle = 0
+        return not self.send(w, key, n)
+
+    def fall_back(self):
+        self.phase = 'to_start'
+        self.last_pos = None
+        self.stable = 0
+        self.await_from = None
 
     def walk_to(self, w, pos):
         rows = self.rows(w)
@@ -264,7 +453,7 @@ def try_fast_path(w, sel_first, sel_last):
         return False
     if sx < 2:  # prompt "❯ " / wrap indent: needs the boundary-probing walker
         return False
-    rows = w.as_text().split('\n')
+    rows = visual_rows(w)
     row = rows[cy] if cy < len(rows) else ''
     row_cells = sum(cw for _, cw in clusters(row))
     snapped = snap_to_cluster(row, sx)
@@ -322,10 +511,28 @@ def handle_result(args, answer, target_window_id, boss):
         return y - row_off, x
 
     sel_first, sel_last = cell(first), cell(last)
+    cur = (screen.cursor.y, screen.cursor.x)
+    rows = visual_rows(w)
+    # Clip the selection to the editable block — Claude's input box, or the
+    # caret's own logical line in a bare shell. Whatever lies outside it (the
+    # transcript, the box rule, the status lines, earlier shell output) is
+    # unreachable by the caret, so dropping it up front saves discovering that
+    # the slow way, one stalled keypress at a time.
+    box = input_rows(rows, cur[0])
+    tcol = TEXT_COL if box is not None else 0
+    top, bot = box if box is not None else logical_run(rows, cols, cur[0])
+    if sel_last[0] < top or sel_first[0] > bot:
+        screen.clear_selection()
+        return
+    sel_first = max(sel_first, (top, tcol))
+    sel_last = min(sel_last, (bot, max(row_len_cells(rows[bot]) - 1, 0)))
+    if sel_first > sel_last:
+        screen.clear_selection()
+        return
     if try_fast_path(w, sel_first, sel_last):
         return
-    orig = (screen.cursor.y, screen.cursor.x)
-    machine = SelDel(boss, target_window_id, sel_first, sel_last, orig)
+    plan = plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol)
+    machine = SelDel(boss, target_window_id, sel_first, sel_last, cur, plan)
     active.add(target_window_id)
     add_timer(machine, 0, False)
 

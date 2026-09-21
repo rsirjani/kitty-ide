@@ -79,34 +79,44 @@ so highlighting text in the input box and hitting backspace deletes it. With
 no selection the key passes straight through (`window.send_key` respects the
 app's keyboard-protocol mode), so normal typing is untouched.
 
-The common case — selection confined to the caret's own row, clear of the
-prompt/indent margin — takes a fast path: the arrow+backspace count is exactly
-computable from the row's cluster map, so the whole edit is one
-`send_key` write, visually instant, no timer at all. Extra backspaces can't
-escape the input (backspace at position 0 is a no-op), so it's as safe as the
-walker. Everything else falls through to the verified walker below.
-
 How it can work at all: kitty knows the selected screen cells
 (`screen.current_selections()` — note the bitmap carries an extra top row vs
-cursor/`as_text` coordinates, hence the `row_off` correction), and Claude Code
-keeps the *real* terminal cursor parked on the input caret (hidden with
-`?25l`, but positioned — an IME affordance). The kitten walks the caret to the
-selection start with arrow keys, walks right through the selection counting
-actual keypresses, then sends that many backspaces. Every batch is verified
-against the live cursor on a timer (`add_timer`; decisions only on frames
-where the cursor has been stable a few ticks), and batch sizes come from the
-screen text itself via a wcwidth cluster map, so wide chars cost one press.
-Row crossings are ambiguous (soft wrap = 0 presses, real newline = 1), so they
-are probed one press at a time and counted only if the cursor moved.
+cursor coordinates, hence the `row_off` correction), and Claude Code keeps the
+*real* terminal cursor parked on the input caret (hidden with `?25l`, but
+positioned — an IME affordance). So the kitten can compute, from the screen
+text alone, how many keypresses separate the caret from the selection and how
+many characters the selection spans — and then check that arithmetic against
+the live cursor before deleting anything.
 
-The walk is self-limiting, which is the safety story: anything the caret
-cannot reach — chat history above the input, the `❯ ` prompt, blank padding —
-makes an arrow press move nothing, which reads as a boundary. So the deletion
-is exactly the intersection of the selection with the editable text, and a
-selection entirely outside the input deletes nothing (the caret is walked back
-to where it started). Wrong deletions are undoable with Claude Code's input
-undo (`ctrl+_`). It also works on the bare zsh prompt in the same pane, since
-zle has the same arrow/backspace semantics.
+The edit is a one-shot. The selection is first clipped to the editable block:
+Claude's input box (the `❯ ` row plus its indented continuation rows, ending
+at the box rule) or, at a bare shell prompt, the caret's own logical line. A
+selection that misses that block entirely is dropped without touching the
+pane. Then, if the selection sits on the caret's row, one `send_key` write
+carries the arrows and the backspaces together — no timer at all. Otherwise
+it's one arrow burst to just past the selection's end, one landing check, and
+one burst of backspaces: two writes, no visible caret crawl.
+
+Counting rules, all derived from the screen text: rows are split into
+grapheme-ish clusters (wcwidth, zero-width chars attaching to the previous
+cell) so a wide char costs one press rather than two; a row boundary costs one
+press only when the row stopped short of the screen edge, because a row filled
+to the edge wrapped mid-text and its last cell is adjacent to the next row's
+first. Rows come from `as_text(add_wrap_markers=True)` split on the markers —
+plain `as_text()` re-joins soft-wrapped lines, so its indices drift from the
+cursor's row as soon as anything wraps.
+
+Deletion is always expressed as backspaces, never forward-delete: zsh takes
+`CSI 3~` apart and inserts a literal `~` per press, while backspace is
+understood by every line editor and is a no-op at column 0.
+
+Safety comes from the arithmetic being checked rather than trusted. The
+backspaces go out only once the caret has landed exactly where the count
+predicted; if it lands anywhere else, the kitten falls back to the original
+walker, which inches the caret along in verified batches and stalls at
+whatever it cannot cross (the prompt, padding, the transcript) instead of
+deleting past it. Wrong deletions remain undoable with Claude Code's input
+undo (`ctrl+_`).
 
 ## Waybar window title → chat title
 
