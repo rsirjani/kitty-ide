@@ -79,6 +79,13 @@ so highlighting text in the input box and hitting backspace deletes it. With
 no selection the key passes straight through (`window.send_key` respects the
 app's keyboard-protocol mode), so normal typing is untouched.
 
+The common case — selection confined to the caret's own row, clear of the
+prompt/indent margin — takes a fast path: the arrow+backspace count is exactly
+computable from the row's cluster map, so the whole edit is one
+`send_key` write, visually instant, no timer at all. Extra backspaces can't
+escape the input (backspace at position 0 is a no-op), so it's as safe as the
+walker. Everything else falls through to the verified walker below.
+
 How it can work at all: kitty knows the selected screen cells
 (`screen.current_selections()` — note the bitmap carries an extra top row vs
 cursor/`as_text` coordinates, hence the `row_off` correction), and Claude Code

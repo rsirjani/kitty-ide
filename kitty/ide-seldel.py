@@ -37,10 +37,10 @@
 
 from kitty.fast_data_types import add_timer, wcwidth
 
-TICK = 0.015          # seconds between cursor polls
-STABLE_TICKS = 3      # cursor unchanged this long => frame settled, safe to act
-STALL_TICKS = 20      # a sent press moved nothing for this long => boundary
-MAX_TOTAL_TICKS = 600 # ~9s hard stop for the whole operation
+TICK = 0.008          # seconds between cursor polls
+STABLE_TICKS = 2      # cursor unchanged this long => frame settled, safe to act
+STALL_TICKS = 15      # a sent press moved nothing for this long => boundary
+MAX_TOTAL_TICKS = 1100 # ~9s hard stop for the whole operation
 MAX_PRESSES = 4000    # absolute cap on synthesized keypresses
 
 active = set()  # window ids with an operation in flight
@@ -249,6 +249,47 @@ class SelDel:
         return True
 
 
+def try_fast_path(w, sel_first, sel_last):
+    """Selection confined to the caret's own row: the arrow/backspace count is
+    exactly computable from the cluster map, so the whole edit goes out in one
+    write — no walking, no timer, visually instant. This is the common case
+    (sweeping part of the line being typed). Anything else — other rows,
+    selections touching the prompt/indent margin — returns False and takes the
+    verified walker. Extra backspaces can't escape the input box (backspace at
+    position 0 is a no-op), so the one-shot is as safe as the walker here."""
+    screen = w.screen
+    cy, cx = screen.cursor.y, screen.cursor.x
+    (sy, sx), (ey, ex) = sel_first, sel_last
+    if not (sy == ey == cy):
+        return False
+    if sx < 2:  # prompt "❯ " / wrap indent: needs the boundary-probing walker
+        return False
+    rows = w.as_text().split('\n')
+    row = rows[cy] if cy < len(rows) else ''
+    row_cells = sum(cw for _, cw in clusters(row))
+    snapped = snap_to_cluster(row, sx)
+    if snapped is None:
+        return False  # selection starts past the text: nothing deletable
+    sx = snapped[0]
+    snapped = snap_to_cluster(row, min(ex, row_cells - 1))
+    if snapped is None:
+        return False
+    end = snapped[1]
+    if end < sx:
+        return False
+    n_del = presses_between(row, sx, end + 1)
+    if n_del <= 0:
+        return False
+    if cx <= end:
+        keys = ['right'] * presses_between(row, cx, end + 1)
+    else:
+        keys = ['left'] * presses_between(row, end + 1, cx)
+    keys += ['backspace'] * n_del
+    screen.clear_selection()
+    w.send_key(*keys)
+    return True
+
+
 def main(args):
     pass  # never runs: no_ui kittens only use handle_result (loader wants it)
 
@@ -280,8 +321,11 @@ def handle_result(args, answer, target_window_id, boss):
         y, x = divmod(i, cols)
         return y - row_off, x
 
+    sel_first, sel_last = cell(first), cell(last)
+    if try_fast_path(w, sel_first, sel_last):
+        return
     orig = (screen.cursor.y, screen.cursor.x)
-    machine = SelDel(boss, target_window_id, cell(first), cell(last), orig)
+    machine = SelDel(boss, target_window_id, sel_first, sel_last, orig)
     active.add(target_window_id)
     add_timer(machine, 0, False)
 
