@@ -128,6 +128,44 @@ at whatever it cannot cross (the prompt, padding, the transcript) instead of
 deleting past it. Wrong deletions remain undoable with Claude Code's input
 undo (`ctrl+_`).
 
+The counting helpers live in `ide_caret.py`, shared with `ide-click.py`. It's
+imported as a plain module (kitty puts the kitten's directory on `sys.path`
+while loading it), so kitty caches it — edits to it need a kitty restart, while
+the kitten files themselves are re-read on every invocation.
+
+## Click-to-place-caret in the claude pane (`ide-click.py`)
+
+The same trick in the other direction: clicking in Claude Code's input box
+moves the caret there. `ide-click.py` is mapped as `mouse_map left click
+ungrabbed`, which kitty can't scope to a pane (`mouse_map` has no
+`--when-focus-on`), so the kitten replays kitty's stock click first — an
+existing selection (a drag just ended) or a link under the mouse wins, and any
+non-claude window gets the plain `mouse_handle_click selection link prompt`.
+Only a click inside the input box moves the caret; anywhere else in the pane
+falls through to the default.
+
+The input box must sit right under the `───` rule. Claude's selection menus
+(permission prompts, the API-key question) also mark the current option with
+`❯`, and arrows there would change the answer, so those are left alone.
+
+The target is chosen like any text field: the right half of a character puts
+the caret after it (half of a wide char's two cells), past the end of a row
+goes to the row's end, the prompt/indent margin goes to the row's start. The
+press count uses the same cluster/row-boundary model as select-to-delete, with
+one extra rule: a caret parked past the end of its row is drawn as an extra
+space cell, which is dropped before counting — otherwise it reads as one more
+character and the burst lands a press too far.
+
+One `send_key` burst does the move. The kitten then watches the caret come to
+rest and, if it rests off target, fires up to two corrective bursts — but only
+after a long stillness (Claude can stall mid-burst, and a correction stacked on
+presses still in flight overshoots) and only if the text is unchanged (if the
+user is already typing, moving the caret would scatter their keystrokes). A
+miss is harmless: arrows only move the caret. A click that arrives while a move
+is still settling is swallowed; the busy flag lives on the kitty `Window`
+object because module globals reset with every kitten invocation. A full-box
+jump (~180 presses) settles in about 150–200 ms.
+
 ## Waybar window title → chat title
 
 Waybar's `hyprland/window` module shows `{title}`, which for the IDE was the

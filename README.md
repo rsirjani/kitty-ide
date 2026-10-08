@@ -67,6 +67,12 @@ scripts.
   through the selection with verified arrow presses, then backspaces it; the
   prompt, chat history and padding are unreachable so only real input text
   ever dies. No selection = the key behaves normally.
+- **Click-to-place-caret in the claude chat** — click anywhere in the text
+  you've typed into Claude Code's input box and the caret jumps there, like a
+  GUI editor (right half of a character = after it, past a line's end = end of
+  that line). A kitten converts the click into a burst of arrow presses and
+  checks where the caret came to rest. Clicks elsewhere — links, the
+  transcript, other panes — behave exactly as before.
 - **Explorer-following terminal** — as you browse directories in the explorer,
   the terminal silently `cd`s to match — but only when it's idle (never typing
   into a running claude session or command).

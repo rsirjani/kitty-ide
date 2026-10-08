@@ -20,6 +20,8 @@ link "$REPO/kitty/ide.conf"          "$HOME/.config/kitty/ide.conf"
 link "$REPO/kitty/ide.session"       "$HOME/.config/kitty/ide.session"
 link "$REPO/kitty/ide-pin-tabbar.py" "$HOME/.config/kitty/ide-pin-tabbar.py"
 link "$REPO/kitty/ide-seldel.py"     "$HOME/.config/kitty/ide-seldel.py"
+link "$REPO/kitty/ide-click.py"      "$HOME/.config/kitty/ide-click.py"
+link "$REPO/kitty/ide_caret.py"      "$HOME/.config/kitty/ide_caret.py"
 link "$REPO/kitty/patches/apply-fixed-lines-patch.py" "$HOME/.config/kitty/patches/apply-fixed-lines-patch.py"
 
 echo "==> yazi config -> ~/.config/yazi-ide"
