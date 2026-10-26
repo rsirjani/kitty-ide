@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# ide-web [carbonyl args...] [url] — carbonyl as a full browser.
+#
+# Starts carbonyl with a DevTools port and ide-web-agent beside it. The agent
+# disguises every tab as the desktop Chrome it really is (no bot flags) and
+# runs the keychain + 2FA verifier. carbonyl starts on about:blank and the
+# agent opens <url> once the disguise is in place, so even the first request
+# looks like a normal browser. Without node, it degrades to plain carbonyl.
+set -euo pipefail
+
+args=("$@")
+url=""
+if [ ${#args[@]} -gt 0 ] && [[ "${args[-1]}" != -* ]]; then
+  url="${args[-1]}"
+  unset 'args[-1]'
+fi
+
+agent="$(dirname "$(realpath "$0")")/ide-web-agent"
+logdir="$HOME/.cache/ide-web"
+mkdir -p "$logdir"
+
+# The agent needs Node >= 22 (built-in WebSocket client).
+node_ok() { command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; }
+
+if ! node_ok || ! mapfile -t flags < <("$agent" --flags 2>/dev/null) || [ ${#flags[@]} -eq 0 ]; then
+  exec carbonyl "${args[@]}" ${url:+"$url"}
+fi
+
+port="$(node -e 'const s = require("net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); })')"
+
+# carbonyl's own CDP features (copy/paste) read the port from this variable.
+export CARBONYL_CDP_PORT="$port"
+"$agent" --port "$port" ${url:+--url "$url"} </dev/null >/dev/null 2>>"$logdir/agent-stderr.log" &
+exec carbonyl "${flags[@]}" --remote-debugging-port="$port" "${args[@]}" about:blank

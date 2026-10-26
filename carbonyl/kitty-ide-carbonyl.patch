@@ -8,10 +8,10 @@ index 0d94ea2..0e2ff97 100644
  
  pub use bridge::*;
 diff --git a/src/browser/bridge.rs b/src/browser/bridge.rs
-index 7b3d629..212dc22 100644
+index 7b3d629..b9ac8f9 100644
 --- a/src/browser/bridge.rs
 +++ b/src/browser/bridge.rs
-@@ -116,10 +116,27 @@ fn main() -> io::Result<Option<i32>> {
+@@ -116,10 +116,26 @@ fn main() -> io::Result<Option<i32>> {
      let mut terminal = input::Terminal::setup();
      let mut command = Command::new(env::current_exe()?);
  
@@ -37,13 +37,12 @@ index 7b3d629..212dc22 100644
 +        if let Some(port) = pick_free_port() {
 +            command
 +                .arg(format!("--remote-debugging-port={port}"))
-+                .arg("--remote-allow-origins=*")
 +                .env(crate::browser::cdp::PORT_ENV, port.to_string());
 +        }
      }
  
      let output = command
-@@ -141,6 +158,17 @@ fn main() -> io::Result<Option<i32>> {
+@@ -141,6 +157,17 @@ fn main() -> io::Result<Option<i32>> {
      Ok(Some(code))
  }
  
@@ -61,7 +60,7 @@ index 7b3d629..212dc22 100644
  #[no_mangle]
  pub extern "C" fn carbonyl_bridge_main() {
      if let Some(code) = main().unwrap() {
-@@ -367,6 +395,19 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
+@@ -367,6 +394,19 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
  
                              emit!(go_to(c_str.as_ptr()))
                          }
@@ -81,7 +80,7 @@ index 7b3d629..212dc22 100644
                      };
  
                      return false;
-@@ -377,6 +418,15 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
+@@ -377,6 +417,15 @@ pub extern "C" fn carbonyl_renderer_listen(bridge: RendererPtr, delegate: *mut B
  
                      match event {
                          Exit => (),
@@ -99,10 +98,10 @@ index 7b3d629..212dc22 100644
  
 diff --git a/src/browser/cdp.rs b/src/browser/cdp.rs
 new file mode 100644
-index 0000000..c289ad8
+index 0000000..4960f5a
 --- /dev/null
 +++ b/src/browser/cdp.rs
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,357 @@
 +//! Tiny synchronous Chrome DevTools Protocol client.
 +//!
 +//! Carbonyl rasterizes page text straight into the framebuffer (bitmap mode),
@@ -162,59 +161,6 @@ index 0000000..c289ad8
 +    let params = format!(r#"{{"text":"{}"}}"#, json_escape(text));
 +
 +    call("Input.insertText", &params).is_some()
-+}
-+
-+/// Fill the page's login form: the first password field gets `password`, the
-+/// nearest preceding text/email field gets `username`. Values are set through
-+/// the native value setter and followed by `input`/`change` events so
-+/// framework-driven forms (React/Vue) see them as real typing. Only ever runs
-+/// on an explicit user keypress (Ctrl+L) — never automatically on page load.
-+pub fn fill_login(username: &str, password: &str) -> bool {
-+    let js = format!(
-+        r#"(() => {{
-+  const set = (el, v) => {{
-+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(el, v);
-+    el.dispatchEvent(new Event('input', {{bubbles: true}}));
-+    el.dispatchEvent(new Event('change', {{bubbles: true}}));
-+  }};
-+  const pw = document.querySelector('input[type=password]');
-+  if (!pw) return false;
-+  const inputs = Array.from(document.querySelectorAll('input'));
-+  const user = inputs.slice(0, inputs.indexOf(pw)).reverse()
-+    .find(el => ['text', 'email', 'tel', ''].includes(el.type || ''));
-+  if (user) set(user, '{u}');
-+  set(pw, '{p}');
-+  return true;
-+}})()"#,
-+        u = js_escape(username),
-+        p = js_escape(password),
-+    );
-+    let params = format!(
-+        r#"{{"expression":"{}","returnByValue":true}}"#,
-+        json_escape(&js)
-+    );
-+
-+    match call("Runtime.evaluate", &params) {
-+        Some(resp) => resp.contains(r#""value":true"#),
-+        None => false,
-+    }
-+}
-+
-+/// Escape a string for inclusion inside a single-quoted JS string literal.
-+fn js_escape(text: &str) -> String {
-+    let mut out = String::with_capacity(text.len());
-+
-+    for c in text.chars() {
-+        match c {
-+            '\\' => out.push_str("\\\\"),
-+            '\'' => out.push_str("\\'"),
-+            '\n' => out.push_str("\\n"),
-+            '\r' => out.push_str("\\r"),
-+            c => out.push(c),
-+        }
-+    }
-+
-+    out
 +}
 +
 +/// Make a single CDP call and return the raw JSON response text.
@@ -1320,7 +1266,7 @@ index 0000000..02c2712
 +    }
 +}
 diff --git a/src/output/renderer.rs b/src/output/renderer.rs
-index f515cad..f127f78 100644
+index f515cad..eea81b0 100644
 --- a/src/output/renderer.rs
 +++ b/src/output/renderer.rs
 @@ -7,19 +7,24 @@ use unicode_segmentation::UnicodeSegmentation;
@@ -1361,7 +1307,7 @@ index f515cad..f127f78 100644
          }
      }
  
-@@ -37,10 +47,146 @@ impl Renderer {
+@@ -37,10 +47,109 @@ impl Renderer {
      }
  
      pub fn keypress(&mut self, key: &Key) -> io::Result<NavigationAction> {
@@ -1417,15 +1363,6 @@ index f515cad..f127f78 100644
 +                    out.flush()?;
 +                    return Ok(NavigationAction::Ignore);
 +                }
-+                // Ctrl+L — fill the page's login form from the system keyring.
-+                // Explicit keypress only, exact-host match only: credentials
-+                // stored with `ide-web-cred add <host>` (secret-tool under the
-+                // hood) are looked up for the current page's host and injected
-+                // over CDP. A look-alike domain never matches a stored host.
-+                0x0c => {
-+                    self.fill_login_from_keyring();
-+                    return Ok(NavigationAction::Ignore);
-+                }
 +                _ => {}
 +            }
 +        }
@@ -1477,38 +1414,10 @@ index f515cad..f127f78 100644
 +        self.nav.insert_text(text)
 +    }
 +
-+    /// Look up credentials for the current page's host in the system keyring
-+    /// (gnome-keyring via `secret-tool`) and fill the page's login form over
-+    /// CDP. Missing tool, no stored entry, or no form all degrade to nothing.
-+    fn fill_login_from_keyring(&self) {
-+        let Some(host) = url_host(self.nav.display_url()) else {
-+            return;
-+        };
-+        let lookup = |field: &str| -> Option<String> {
-+            let out = std::process::Command::new("secret-tool")
-+                .args(["lookup", "service", "carbonyl", "domain", &host, "field", field])
-+                .output()
-+                .ok()?;
-+
-+            if !out.status.success() {
-+                return None;
-+            }
-+
-+            let secret = String::from_utf8(out.stdout).ok()?;
-+            let secret = secret.trim_end_matches('\n');
-+
-+            (!secret.is_empty()).then(|| secret.to_owned())
-+        };
-+
-+        if let (Some(user), Some(pass)) = (lookup("username"), lookup("password")) {
-+            crate::browser::cdp::fill_login(&user, &pass);
-+        }
-+    }
-+
      pub fn mouse_up(&mut self, origin: Point) -> io::Result<NavigationAction> {
          let action = self.nav.mouse_up(origin);
  
-@@ -69,6 +215,16 @@ impl Renderer {
+@@ -69,6 +178,16 @@ impl Renderer {
          self.nav.set_size(size);
          self.size = size;
  
@@ -1525,7 +1434,7 @@ index f515cad..f127f78 100644
          let mut x = 0;
          let mut y = 0;
          let bound = size.width - 1;
-@@ -120,11 +276,31 @@ impl Renderer {
+@@ -120,11 +239,31 @@ impl Renderer {
  
          self.painter.end(self.nav.cursor())?;
  
@@ -1557,35 +1466,6 @@ index f515cad..f127f78 100644
          let viewport = self.size.cast::<usize>();
  
          if pixels.len() < viewport.width * viewport.height * 8 * 4 {
-@@ -282,3 +458,28 @@ impl Renderer {
-         }
-     }
- }
-+
-+/// The host part of a URL ("https://example.com:8080/x" -> "example.com").
-+/// Used as the exact-match key for keyring credential lookups.
-+fn url_host(url: &str) -> Option<String> {
-+    let rest = url.split("://").nth(1)?;
-+    let host = rest.split(['/', '?', '#']).next()?;
-+    let host = host.rsplit('@').next()?; // drop userinfo if present
-+    let host = host.split(':').next()?; // drop port
-+
-+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::url_host;
-+
-+    #[test]
-+    fn extracts_host_for_keyring_lookup() {
-+        assert_eq!(url_host("https://example.com/a?b#c"), Some("example.com".into()));
-+        assert_eq!(url_host("https://Sub.Example.com:8443/x"), Some("sub.example.com".into()));
-+        assert_eq!(url_host("https://user@example.com/"), Some("example.com".into()));
-+        assert_eq!(url_host("about:blank"), None);
-+        assert_eq!(url_host("https://"), None);
-+    }
-+}
 diff --git a/src/output/window.rs b/src/output/window.rs
 index a53c507..912e556 100644
 --- a/src/output/window.rs

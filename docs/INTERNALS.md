@@ -279,6 +279,16 @@ kitty graphics protocol — full resolution, real fonts — instead of half-bloc
 and resolves bare hosts / search queries in the address bar. Default page is
 arXiv.
 
+It goes through `ide-web`, which starts carbonyl on a DevTools port with
+`ide-web-agent` (`bin/web-agent/`, Node ≥ 22) beside it. The agent auto-attaches
+to every tab/frame/worker while it is paused, gives it a normal desktop-Chrome
+identity (UA + client hints, no webdriver flag), and injects the keychain/2FA
+UI into an isolated world per frame — talking to it by long-polling a promise,
+never `Runtime.enable`. Secrets live in the keyring (`ide-web-cred`).
+carbonyl's input bridge delivers Enter/Escape/Ctrl+letter as bare `keypress`
+char codes with an empty `e.key`, so page-side key handling must read
+`charCode`/`keyCode` too.
+
 carbonyl is Chromium, so two tabs sharing one profile would hit Chromium's
 singleton lock — the second refuses to open while the first is up. `ide-open`
 therefore hands each tab its own `--user-data-dir` from a **per-instance

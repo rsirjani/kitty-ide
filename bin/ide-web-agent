@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Sidecar that makes carbonyl a full browser (anti-bot disguise + keychain/
+# verifier). Launched by ide-web; see bin/web-agent/main.mjs.
+exec node "$(dirname "$(realpath "$0")")/web-agent/main.mjs" "$@"

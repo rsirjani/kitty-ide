@@ -39,23 +39,36 @@ A real text field, like a browser omnibox:
 | start / end | `Up` / `Down` |
 | navigate | `Enter` |
 
-## Passwords & real-browser handoff
+## Keychain, 2FA verifier & real-browser handoff
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+L` | fill the page's login form from the system keyring |
-| `Ctrl+O` | open the current URL in the real VD Chromium |
+`ide-open browser` runs carbonyl through `ide-web`, which starts a sidecar
+(`ide-web-agent`, Node, zero deps) on carbonyl's DevTools port:
 
-`Ctrl+L` looks up credentials stored with `ide-web-cred add <host>`
-(gnome-keyring via `secret-tool`, exact-host match only) and injects them over
-CDP with native setters + `input`/`change` events, so framework forms see real
-typing. It only ever runs on the explicit keypress — never on page load — and
-a look-alike domain never matches a stored host.
+- **Keychain** — focus a login field and a dropdown lists the saved accounts
+  for that site (click or ↑/↓ + Enter). After you sign in with new or changed
+  credentials it asks to Save / Update / Never. Two-step logins (email page,
+  then password page) are tracked. Signup fields offer a generated strong
+  password, saved automatically on submit.
+- **Verifier** — 2FA/OTP fields (incl. one-digit-per-box widgets) offer the
+  current TOTP code for the site.
+- `Ctrl+L` opens the dropdown on the focused (or first) login field.
+- **Identity** — carbonyl no longer announces itself as a bot: a standard
+  Chrome user agent with client hints, no `navigator.webdriver`, and the usual
+  `window.chrome`/plugins surface. It reports its real engine version (111).
+
+The UI runs in an isolated world in a closed shadow root, so page scripts
+can't read it or trigger it; fills are typed as trusted input. A frame only
+ever gets credentials for its own site (stored `example.com` also serves
+`login.example.com`, never `example.com.evil.io`).
+
+Secrets live in the system keyring (secret-tool). Manage them with
+`ide-web-cred add|rm|ls`, `ide-web-cred totp add <host>` (paste a base32
+secret or `otpauth://` URI) and `ide-web-cred code <host>`.
 
 `Ctrl+O` hands the URL to `$CARBONYL_OPEN_EXTERNAL_CMD` (default
 `ide-open desktop`): the real Chromium inside the Virtual Desktop, with a
-persistent profile (`/vdshare/chromium-profile`, `--password-store=basic`) —
-full password manager, autofill, extensions, OAuth popups, passkeys.
+persistent profile — use it for passkeys, OAuth popups, and sites that still
+refuse this browser.
 
 ## Zoom & pan (graphics mode)
 

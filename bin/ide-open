@@ -5,7 +5,7 @@
 #   ide-open view    <file>   -> rendered view (md/html/image/video/office/csv/…)
 #   ide-open edit    <file>   -> nvim
 #   ide-open pdf     <file>   -> tdf (fast PDF reader)
-#   ide-open browser [url]    -> carbonyl (in-terminal browser)
+#   ide-open browser [url]    -> ide-web (carbonyl + keychain/2FA, in-terminal browser)
 #   ide-open desktop [url]    -> real Chromium in the Virtual Desktop (for OAuth/
 #                                2FA popups & passkeys that carbonyl can't render)
 #   ide-open toggle           -> morph the focused tab between rendered <-> editable
@@ -187,7 +187,8 @@ do_open() {
 
 do_browser() {
   local url="${1:-https://arxiv.org}" prof; prof="$(carbonyl_profile)"
-  launch_overlay view "" 1 "🌐 web" carbonyl --graphics --user-data-dir="$prof" "$url"
+  # ide-web = carbonyl + the keychain/2FA sidecar and a normal-browser identity.
+  launch_overlay view "" 1 "🌐 web" ide-web --graphics --user-data-dir="$prof" "$url"
 }
 
 # Open a URL in the REAL Chromium inside the Virtual Desktop (a windowed browser
