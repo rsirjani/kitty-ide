@@ -64,6 +64,11 @@ ever gets credentials for its own site (stored `example.com` also serves
 Secrets live in the system keyring (secret-tool). Manage them with
 `ide-web-cred add|rm|ls`, `ide-web-cred totp add <host>` (paste a base32
 secret or `otpauth://` URI) and `ide-web-cred code <host>`.
+`ide-web-cred import firefox [--dry-run] [--overwrite]` copies Firefox's saved
+logins in — decrypted locally through the system NSS library (prompts for the
+Firefox primary password if one is set), never written to disk in the clear.
+Existing keychain entries that differ are reported, not overwritten, unless
+`--overwrite` is given.
 
 `Ctrl+O` hands the URL to `$CARBONYL_OPEN_EXTERNAL_CMD` (default
 `ide-open desktop`): the real Chromium inside the Virtual Desktop, with a

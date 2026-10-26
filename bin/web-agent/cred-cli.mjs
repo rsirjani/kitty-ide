@@ -7,11 +7,14 @@
 //   ide-web-cred totp rm  <host> [username]      remove a 2FA secret
 //   ide-web-cred code <host> [username]          print the current 2FA code
 //   ide-web-cred never rm <host>                 allow save prompts again for a host
+//   ide-web-cred import firefox [profile] [--dry-run] [--overwrite]
+//                                                copy Firefox's saved logins in
 //
 // Secrets live in the system keyring (secret-tool). The browser offers them
 // on login / 2FA fields of the matching site (and its subdomains) only.
 
 import readline from 'node:readline';
+import { importFirefox, summarize } from './firefox-import.mjs';
 import { Keychain, normalizeHost } from './keychain.mjs';
 import { parseTotp } from './totp.mjs';
 
@@ -21,7 +24,8 @@ const USAGE = `usage:
   ide-web-cred ls
   ide-web-cred totp add|rm <host> [username]
   ide-web-cred code <host> [username]
-  ide-web-cred never rm <host>`;
+  ide-web-cred never rm <host>
+  ide-web-cred import firefox [profile dir] [--dry-run] [--overwrite]`;
 
 function ask(question, { hidden = false } = {}) {
   return new Promise((resolve) => {
@@ -46,7 +50,8 @@ function need(value) {
 
 async function main(argv) {
   const kc = new Keychain();
-  const [cmd, a, b, c] = argv;
+  const flags = new Set(argv.filter((x) => x.startsWith('--')));
+  const [cmd, a, b, c] = argv.filter((x) => !x.startsWith('--'));
 
   switch (cmd) {
     case 'add': {
@@ -90,6 +95,12 @@ async function main(argv) {
       if (a !== 'rm') throw new Error(USAGE);
       kc.setNeverSave(need(b), false);
       return `save prompts re-enabled for ${b}`;
+    }
+    case 'import': {
+      if (a !== 'firefox') throw new Error(USAGE);
+      const dryRun = flags.has('--dry-run');
+      const result = await importFirefox(kc, { profile: b, dryRun, overwrite: flags.has('--overwrite') });
+      return summarize(result, { dryRun });
     }
     default:
       throw new Error(USAGE);
