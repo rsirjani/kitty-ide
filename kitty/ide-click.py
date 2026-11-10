@@ -103,6 +103,70 @@ def prompt_click(w):
         return False
 
 
+def _chars_before(row, x, end):
+    """Characters in cells [0, x) of a screen row whose text runs to cell
+    `end` (cells past the stored text are blanks)."""
+    n = cell = 0
+    for ch in row:
+        if cell >= x:
+            return n
+        wd = cell_width(ch)
+        if wd <= 0:
+            continue
+        n += 1
+        cell += wd
+    return n + max(min(x, end) - cell, 0)
+
+
+def zle_click(w):
+    """Move a zsh caret to the mouse with ONE key sequence (ide-caret.zsh turns
+    it into an assignment to CURSOR) instead of kitty's arrow key per cell.
+    The distance is counted on screen, in characters, from the caret to the
+    click; zsh clamps it to its buffer, so a click past the end of the line,
+    or on the grey autosuggestion, lands at the end. False when the window's
+    shell doesn't speak this (no `ide_zle` user var)."""
+    if (w.user_vars or {}).get('ide_zle') != '1':
+        return False
+    screen = w.screen
+    mouse = w.current_mouse_position()
+    if not mouse or screen.scrolled_by or screen.is_using_alternate_linebuf():
+        return True
+    cols = screen.columns
+    cy, cx = screen.cursor.y, screen.cursor.x
+    rows = visual_rows(w)
+    rows += [''] * (screen.lines - len(rows))
+
+    def end(r):
+        return max(row_len_cells(rows[r]), cx if r == cy else 0)
+
+    def newline(r):         # a row that stops short of the edge ends in a real "\n"
+        return 0 if end(r) >= cols else 1
+
+    ty = mouse['cell_y']
+    tx = mouse['cell_x'] + (0 if mouse['in_left_half_of_cell'] else 1)
+    if not 0 <= ty < len(rows):
+        return True
+    tx = min(tx, end(ty))
+    a, b = sorted(((cy, cx), (ty, tx)))
+    if a[0] == b[0]:
+        n = _chars_before(rows[a[0]], b[1], end(a[0])) - _chars_before(rows[a[0]], a[1], end(a[0]))
+    else:
+        n = _chars_before(rows[a[0]], end(a[0]), end(a[0])) - _chars_before(rows[a[0]], a[1], end(a[0])) + newline(a[0])
+        for r in range(a[0] + 1, b[0]):
+            n += _chars_before(rows[r], end(r), end(r)) + newline(r)
+        n += _chars_before(rows[b[0]], b[1], end(b[0]))
+    if (ty, tx) < (cy, cx):
+        n = -n
+    _trace('  zle', (cy, cx), '->', (ty, tx), n)
+    if n:
+        w.write_to_child(f'\x1b[5733;{n};{abs(ty - cy)}~'.encode())
+    return True
+
+
+def shell_click(w):
+    return zle_click(w) or prompt_click(w)
+
+
 def editable_box(rows, cy):
     """(first, last) rows of Claude Code's input box around the caret, or None.
     Stricter than input_rows alone: the `❯` row must sit right under the box's
@@ -369,7 +433,7 @@ def handle_result(args, answer, target_window_id, boss):
                         go = still and dt >= HOLD_IS_CLICK
                     if go:
                         if not (claude and place_caret(boss, win)):
-                            prompt_click(win)
+                            shell_click(win)
                     elif dt < GIVE_UP and (down is None or down):
                         add_timer(later, TICK, False)
                 except Exception:
@@ -378,8 +442,17 @@ def handle_result(args, answer, target_window_id, boss):
                     log_error('ide-click: ' + traceback.format_exc())
             add_timer(later, TICK, False)
         return
+    zle = (w.user_vars or {}).get('ide_zle') == '1'
     if w.user_vars.get('pane') != 'claude':
-        w.mouse_handle_click('selection', 'link', 'prompt')
+        if not zle:
+            w.mouse_handle_click('selection', 'link', 'prompt')
+            return
+        # a zsh that takes the caret jump directly: everything kitty's default
+        # click does except its arrow-key walk to the prompt position
+        if w.screen.has_selection():
+            w.mouse_handle_click('selection')
+        elif not click_mouse_url(w.os_window_id, w.tab_id, w.id):
+            zle_click(w)
         return
     if w.screen.has_selection():
         return  # a drag-select just ended: keep it (ide-seldel acts on it)
@@ -394,7 +467,8 @@ def handle_result(args, answer, target_window_id, boss):
         import traceback
         from kitty.utils import log_error
         log_error('ide-click: ' + traceback.format_exc())
-    w.mouse_handle_click('prompt')
+    if not zle_click(w):
+        w.mouse_handle_click('prompt')
 
 
 handle_result.no_ui = True

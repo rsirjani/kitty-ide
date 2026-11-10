@@ -77,7 +77,12 @@ scripts.
   and the indent go, while code, lists, tables and tool output keep their shape.
 - **The same at a plain shell prompt** — in zsh/bash (anything with kitty's
   shell integration) a click on the command line moves the caret there on
-  release, and a mouse selection plus backspace deletes it.
+  release, and a mouse selection plus backspace deletes it. In zsh, source
+  `kitty/ide-caret.zsh` from `~/.zshrc` (after your plugins; `install.sh` links
+  it to `~/.config/kitty/ide-caret.zsh`): the click then becomes one direct
+  jump of the caret instead of kitty's arrow key per character, which crawls
+  under zsh-syntax-highlighting and makes zsh-autosuggestions accept the grey
+  suggestion when you click past the end of the line.
 - **Select-to-delete in the claude chat** — highlight text in Claude Code's
   input box with the mouse and press backspace/delete to remove it, like a GUI
   editor. A kitten walks the (hidden but caret-tracking) terminal cursor
