@@ -75,6 +75,9 @@ scripts.
   Anything copied from the claude pane (select-to-copy, `Ctrl+C`, middle click)
   is re-flowed first: wrapped paragraphs become single lines, the `●` bullet
   and the indent go, while code, lists, tables and tool output keep their shape.
+- **The same at a plain shell prompt** — in zsh/bash (anything with kitty's
+  shell integration) a click on the command line moves the caret there on
+  release, and a mouse selection plus backspace deletes it.
 - **Select-to-delete in the claude chat** — highlight text in Claude Code's
   input box with the mouse and press backspace/delete to remove it, like a GUI
   editor. A kitten walks the (hidden but caret-tracking) terminal cursor

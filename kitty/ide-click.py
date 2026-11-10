@@ -92,6 +92,17 @@ def _button_down(boss):
     return False
 
 
+def prompt_click(w):
+    """Move a shell's caret to the mouse, if the mouse is on the prompt being
+    edited (kitty's shell integration marks it and works out the key presses).
+    True if it did."""
+    try:
+        from kitty.fast_data_types import move_cursor_to_mouse_if_in_prompt
+        return bool(move_cursor_to_mouse_if_in_prompt(w.os_window_id, w.tab_id, w.id))
+    except Exception:
+        return False
+
+
 def editable_box(rows, cy):
     """(first, last) rows of Claude Code's input box around the caret, or None.
     Stricter than input_rows alone: the `❯` row must sit right under the box's
@@ -323,10 +334,16 @@ def handle_result(args, answer, target_window_id, boss):
             import traceback
             from kitty.utils import log_error
             log_error('ide-click: ' + traceback.format_exc())
-        if w.user_vars.get('pane') == 'claude':
+        # Any window: a click on a shell prompt (zsh, bash, fish -- anything
+        # with kitty's shell integration) moves the caret there too. kitty can
+        # do that itself, but only wires it to the late "click" event; called
+        # from here it happens on release. In the claude pane Claude Code's
+        # input box is tried first.
+        if True:
             import time
             t0 = time.monotonic()
             cell0 = w.current_mouse_position()
+            claude = w.user_vars.get('pane') == 'claude'
 
             def later(timer_id=None):
                 # Is this press a click or the start of a drag? Moving the
@@ -351,7 +368,8 @@ def handle_result(args, answer, target_window_id, boss):
                         # finger resting on the touchpad), not a drag
                         go = still and dt >= HOLD_IS_CLICK
                     if go:
-                        place_caret(boss, win)
+                        if not (claude and place_caret(boss, win)):
+                            prompt_click(win)
                     elif dt < GIVE_UP and (down is None or down):
                         add_timer(later, TICK, False)
                 except Exception:
