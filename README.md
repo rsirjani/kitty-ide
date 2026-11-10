@@ -82,7 +82,8 @@ scripts.
   it to `~/.config/kitty/ide-caret.zsh`): the click then becomes one direct
   jump of the caret instead of kitty's arrow key per character, which crawls
   under zsh-syntax-highlighting and makes zsh-autosuggestions accept the grey
-  suggestion when you click past the end of the line.
+  suggestion when you click past the end of the line. Select + backspace is
+  likewise one cut inside zsh's line editor, with no caret travel.
 - **Select-to-delete in the claude chat** — highlight text in Claude Code's
   input box with the mouse and press backspace/delete to remove it, like a GUI
   editor. A kitten walks the (hidden but caret-tracking) terminal cursor

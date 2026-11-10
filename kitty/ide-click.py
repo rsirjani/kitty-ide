@@ -23,10 +23,10 @@
 from kitty.fast_data_types import add_timer, click_mouse_url
 
 import ide_caret
-if getattr(ide_caret, 'VERSION', 0) < 5:   # kitty caches the module: pick up fixes live
+if getattr(ide_caret, 'VERSION', 0) < 6:   # kitty caches the module: pick up fixes live
     import importlib
     importlib.reload(ide_caret)
-from ide_caret import TEXT_COL, cell_width, input_rows, row_keys, row_len_cells, snap_to_cluster, visual_rows
+from ide_caret import TEXT_COL, cell_width, char_delta, input_rows, row_keys, row_len_cells, snap_to_cluster, visual_rows
 
 TICK = 0.008            # seconds between cursor polls
 PRESS_WAIT = 0.09       # no button state available: a press not dragged by then is a click
@@ -103,21 +103,6 @@ def prompt_click(w):
         return False
 
 
-def _chars_before(row, x, end):
-    """Characters in cells [0, x) of a screen row whose text runs to cell
-    `end` (cells past the stored text are blanks)."""
-    n = cell = 0
-    for ch in row:
-        if cell >= x:
-            return n
-        wd = cell_width(ch)
-        if wd <= 0:
-            continue
-        n += 1
-        cell += wd
-    return n + max(min(x, end) - cell, 0)
-
-
 def zle_click(w):
     """Move a zsh caret to the mouse with ONE key sequence (ide-caret.zsh turns
     it into an assignment to CURSOR) instead of kitty's arrow key per cell.
@@ -125,38 +110,20 @@ def zle_click(w):
     click; zsh clamps it to its buffer, so a click past the end of the line,
     or on the grey autosuggestion, lands at the end. False when the window's
     shell doesn't speak this (no `ide_zle` user var)."""
-    if (w.user_vars or {}).get('ide_zle') != '1':
+    if (w.user_vars or {}).get('ide_zle') not in ('1', '2'):
         return False
     screen = w.screen
     mouse = w.current_mouse_position()
     if not mouse or screen.scrolled_by or screen.is_using_alternate_linebuf():
         return True
-    cols = screen.columns
     cy, cx = screen.cursor.y, screen.cursor.x
     rows = visual_rows(w)
     rows += [''] * (screen.lines - len(rows))
-
-    def end(r):
-        return max(row_len_cells(rows[r]), cx if r == cy else 0)
-
-    def newline(r):         # a row that stops short of the edge ends in a real "\n"
-        return 0 if end(r) >= cols else 1
-
     ty = mouse['cell_y']
     tx = mouse['cell_x'] + (0 if mouse['in_left_half_of_cell'] else 1)
     if not 0 <= ty < len(rows):
         return True
-    tx = min(tx, end(ty))
-    a, b = sorted(((cy, cx), (ty, tx)))
-    if a[0] == b[0]:
-        n = _chars_before(rows[a[0]], b[1], end(a[0])) - _chars_before(rows[a[0]], a[1], end(a[0]))
-    else:
-        n = _chars_before(rows[a[0]], end(a[0]), end(a[0])) - _chars_before(rows[a[0]], a[1], end(a[0])) + newline(a[0])
-        for r in range(a[0] + 1, b[0]):
-            n += _chars_before(rows[r], end(r), end(r)) + newline(r)
-        n += _chars_before(rows[b[0]], b[1], end(b[0]))
-    if (ty, tx) < (cy, cx):
-        n = -n
+    n = char_delta(rows, screen.columns, (cy, cx), (ty, tx))
     _trace('  zle', (cy, cx), '->', (ty, tx), n)
     if n:
         w.write_to_child(f'\x1b[5733;{n};{abs(ty - cy)}~'.encode())
@@ -442,7 +409,7 @@ def handle_result(args, answer, target_window_id, boss):
                     log_error('ide-click: ' + traceback.format_exc())
             add_timer(later, TICK, False)
         return
-    zle = (w.user_vars or {}).get('ide_zle') == '1'
+    zle = (w.user_vars or {}).get('ide_zle') in ('1', '2')
     if w.user_vars.get('pane') != 'claude':
         if not zle:
             w.mouse_handle_click('selection', 'link', 'prompt')

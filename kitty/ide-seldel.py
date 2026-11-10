@@ -49,7 +49,7 @@ import json
 import os
 
 import ide_caret
-if getattr(ide_caret, 'VERSION', 0) < 5:   # kitty caches the module: pick up fixes live
+if getattr(ide_caret, 'VERSION', 0) < 6:   # kitty caches the module: pick up fixes live
     import importlib
     importlib.reload(ide_caret)
 from ide_caret import (
@@ -1061,6 +1061,21 @@ def handle_result(args, answer, target_window_id, boss):
     # unreachable by the caret, so dropping it up front saves discovering that
     # the slow way, one stalled keypress at a time.
     box = input_rows(rows, cur[0])
+    if box is None and (w.user_vars or {}).get('ide_zle') == '2' and not screen.is_using_alternate_linebuf():
+        # zsh with ide-caret.zsh: tell the line editor which characters to cut,
+        # counted from the caret, in one key sequence. No caret travel, one
+        # repaint, and zsh clamps the range to its own buffer -- so a selection
+        # that runs into the prompt, old output or the grey autosuggestion only
+        # ever takes real command-line text.
+        rows = rows + [''] * (screen.lines - len(rows))
+        if 0 <= sel_first[0] and sel_last[0] < len(rows):
+            a = ide_caret.char_delta(rows, cols, cur, sel_first)
+            b = ide_caret.char_delta(rows, cols, cur, (sel_last[0], sel_last[1] + 1))
+            _trace('  zle cut', cur, sel_first, sel_last, a, b)
+            if b > a:
+                w.write_to_child(f'\x1b[5734;{a};{b}~'.encode())
+        screen.clear_selection()
+        return
     tcol = TEXT_COL if box is not None else 0
     top, bot = box if box is not None else logical_run(rows, cols, cur[0])
     if sel_last[0] < top or sel_first[0] > bot:

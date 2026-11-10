@@ -14,7 +14,7 @@
 
 from kitty.fast_data_types import wcwidth
 
-VERSION = 5  # the kittens reload this module when the cached copy is older
+VERSION = 6  # the kittens reload this module when the cached copy is older
 
 
 def cell_width(ch):
@@ -220,3 +220,51 @@ def presses_over(rows, cols, pfrom, pto, tcol):
         if r < by:
             n += boundary_cost(rows, r, cols)
     return n
+
+
+def chars_before(row, x, end):
+    """Characters in cells [0, x) of a screen row whose text runs to cell
+    `end` (cells past the stored text are blanks)."""
+    n = cell = 0
+    for ch in row:
+        if cell >= x:
+            return n
+        wd = cell_width(ch)
+        if wd <= 0:
+            continue
+        n += 1
+        cell += wd
+    return n + max(min(x, end) - cell, 0)
+
+
+def char_delta(rows, cols, cur, pos):
+    """Signed number of characters a line editor has between the caret (cell
+    `cur`) and the cell `pos`, counted off the screen: every drawn character is
+    one, and a row that stops short of the right edge ends in a real newline
+    (a row filled to the edge just wrapped). Used for zsh, which is then told
+    to move / cut by that many characters in one go (ide-caret.zsh) and clamps
+    the result to its own buffer."""
+    cy, cx = cur
+
+    def end(r):
+        # zsh pads a row it redraws shorter with written spaces, which look
+        # like text: on a row that didn't wrap, trailing blanks don't count
+        n = row_len_cells(rows[r])
+        if n < cols:
+            n = row_len_cells(rows[r].rstrip())
+        return max(n, cx if r == cy else 0)
+
+    def newline(r):
+        return 0 if end(r) >= cols else 1
+
+    ty, tx = pos
+    tx = min(tx, end(ty))
+    a, b = sorted(((cy, cx), (ty, tx)))
+    if a[0] == b[0]:
+        n = chars_before(rows[a[0]], b[1], end(a[0])) - chars_before(rows[a[0]], a[1], end(a[0]))
+    else:
+        n = chars_before(rows[a[0]], end(a[0]), end(a[0])) - chars_before(rows[a[0]], a[1], end(a[0])) + newline(a[0])
+        for r in range(a[0] + 1, b[0]):
+            n += chars_before(rows[r], end(r), end(r)) + newline(r)
+        n += chars_before(rows[b[0]], b[1], end(b[0]))
+    return -n if (ty, tx) < (cy, cx) else n
