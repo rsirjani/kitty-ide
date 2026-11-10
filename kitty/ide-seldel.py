@@ -524,6 +524,33 @@ class Box:
                 n += self.bcost(self.cells[j][1])
         return n
 
+    def row_end(self, r):
+        """Column just past the last character of row r."""
+        xs = [c[2] + max(cell_width(c[0]), 1) for c in self.cells if c[1] == r]
+        return max(xs) if xs else TEXT_COL
+
+    def travel(self, frm, to):
+        """Keys that move the caret from cell `frm` to cell `to` ((row, col)).
+        Rows are crossed with up/down -- one press per row instead of a whole
+        row of left/right presses, which is what made a delete far from the
+        caret take hundreds of keys -- then the column is closed on the target
+        row. Claude keeps the caret's column when moving vertically, clamped
+        to the row's end. Any misjudgement is caught by the marker check."""
+        (r0, x0), (r1, x1) = frm, to
+        keys = []
+        if r1 != r0:
+            keys += ['up' if r1 < r0 else 'down'] * abs(r1 - r0)
+            x0 = max(min(x0, self.row_end(r1)), TEXT_COL)
+        lo, hi = min(x0, x1), max(x0, x1)
+        n = sum(1 for c in self.cells if c[1] == r1 and lo <= c[2] < hi)
+        keys += ['left' if x1 < x0 else 'right'] * n
+        return keys
+
+    def after(self, i):
+        """Cell position of the caret sitting just after cell i."""
+        ch, r, x = self.cells[i]
+        return (r, x + max(cell_width(ch), 1))
+
     def neighbour(self, i, step, row):
         """Nearest non-marker cell from point i going left (-1) / right (+1),
         if it is on `row`; else None."""
@@ -617,6 +644,7 @@ class MarkDel:
             add_timer(self, TICK, False)
 
     def log(self, *a):
+        _trace('  markdel', *a)
         if DEBUG:
             from kitty.utils import log_error
             log_error('seldel: ' + ' '.join(str(x) for x in a))
@@ -685,11 +713,8 @@ class MarkDel:
         self.mE = self.new_mark(box)
         if self.mE is None:
             return True
-        ci = box.caret_index()
-        tgt = li + 1
-        keys = ['right'] * box.presses(ci, tgt) if tgt >= ci else ['left'] * box.presses(tgt, ci)
         self.phase = 'end'
-        return self.send(w, keys, self.mE)
+        return self.send(w, box.travel(box.cur, box.after(li)), self.mE)
 
     def on_end(self, w, box):
         m = box.find(self.mE)
@@ -701,7 +726,7 @@ class MarkDel:
                 self.send(w, ['backspace'])
                 return True
             self.phase = 'begin'
-            return self.send(w, ['left'] * box.presses(tgt, m + 1), self.mS)
+            return self.send(w, box.travel(box.after(m), box.cells[tgt][1:]), self.mS)
         return self.fix(w, box, m, self.want_e, 'mE')
 
     def fix(self, w, box, m, want, attr):
@@ -826,10 +851,23 @@ def main(args):
     pass  # never runs: no_ui kittens only use handle_result (loader wants it)
 
 
+def _trace(*a):
+    """One line per event in /tmp/ide-kittens.log -- cheap, and the only way to
+    see afterwards what a click / delete in a live session actually did."""
+    try:
+        import time
+        with open('/tmp/ide-kittens.log', 'a') as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {time.monotonic():.3f} " + ' '.join(str(x) for x in a) + '\n')
+    except OSError:
+        pass
+
+
 def handle_result(args, answer, target_window_id, boss):
     w = boss.window_id_map.get(target_window_id)
     if w is None:
         return
+    _trace('seldel', args[1:], 'sel', w.screen.has_selection(), 'busy', getattr(w, '_ide_seldel_busy', 0) > 0,
+           'cur', (w.screen.cursor.y, w.screen.cursor.x))
     key = args[1] if len(args) > 1 else 'backspace'
     # An operation is in flight: swallow the key (a repeat, or a second press).
     # The flag lives on the Window -- kitty re-executes this file per call, so a

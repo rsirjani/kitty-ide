@@ -29,6 +29,7 @@ if getattr(ide_caret, 'VERSION', 0) < 2:   # kitty caches the module: pick up fi
 from ide_caret import TEXT_COL, input_rows, presses_over, row_len_cells, snap_to_cluster, visual_rows
 
 TICK = 0.008            # seconds between cursor polls
+PRESS_WAIT = 0.09       # a press not dragged into a selection by then is a click
 REST_TICKS = 6          # cursor still this long on target => arrived
 CORRECT_REST_TICKS = 40 # still this long OFF target => burst is spent, correct
 SETTLE_TICKS = 150      # burst never came to rest => give up
@@ -218,23 +219,51 @@ def main(args):
     pass  # never runs: no_ui kittens only use handle_result (loader wants it)
 
 
+def _trace(*a):
+    """One line per event in /tmp/ide-kittens.log -- cheap, and the only way to
+    see afterwards what a click / delete in a live session actually did."""
+    try:
+        import time
+        with open('/tmp/ide-kittens.log', 'a') as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {time.monotonic():.3f} " + ' '.join(str(x) for x in a) + '\n')
+    except OSError:
+        pass
+
+
 def handle_result(args, answer, target_window_id, boss):
     w = boss.window_id_map.get(target_window_id)
     if w is None:
         return
-    if len(args) > 1 and args[1] == 'release':
-        # Fast path. kitty only reports a "click" once its double-click window
+    _trace('click', args[1:], 'pane', w.user_vars.get('pane'), 'sel', w.screen.has_selection(),
+           'cur', (w.screen.cursor.y, w.screen.cursor.x))
+    if len(args) > 1 and args[1] == 'press':
+        # Fast path. kitty reports a "click" only once its double-click window
         # (click_interval, ~half a second) has passed, which made every caret
-        # move feel laggy. The button release is reported at once, so the move
-        # starts here; the later click event then finds the caret already in
-        # place. A drag leaves a selection behind, and is left alone.
+        # move feel laggy -- and it never reports the release of a plain left
+        # button at all while it is tracking a possible drag. The press is the
+        # only prompt event there is. So this mapping replaces kitty's default
+        # for it (start a selection -- done first, unconditionally), and a
+        # moment later, if no drag has turned it into a selection, treats it as
+        # a click and moves the caret. The later click event then finds the
+        # caret already in place.
         try:
-            if w.user_vars.get('pane') == 'claude' and not w.screen.has_selection():
-                place_caret(boss, w)
+            from kitty.fast_data_types import MOUSE_SELECTION_NORMAL
+            w.mouse_selection(MOUSE_SELECTION_NORMAL)
         except Exception:
             import traceback
             from kitty.utils import log_error
             log_error('ide-click: ' + traceback.format_exc())
+        if w.user_vars.get('pane') == 'claude':
+            def later(timer_id=None):
+                try:
+                    win = boss.window_id_map.get(target_window_id)
+                    if win is not None and not win.screen.has_selection():
+                        place_caret(boss, win)
+                except Exception:
+                    import traceback
+                    from kitty.utils import log_error
+                    log_error('ide-click: ' + traceback.format_exc())
+            add_timer(later, PRESS_WAIT, False)
         return
     if w.user_vars.get('pane') != 'claude':
         w.mouse_handle_click('selection', 'link', 'prompt')
