@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # the desktop itself
-      xvfb x11vnc openbox xdotool \
+      xvfb x11vnc tigervnc-standalone-server openbox xdotool \
       x11-utils x11-xserver-utils dbus-x11 \
       # a real browser for testing web front-ends
       chromium \

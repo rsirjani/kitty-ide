@@ -147,6 +147,17 @@ def compute_geometry(fd):
     y = max(0, (rows - r - 2) // 2)
     return c, r, x, y, cols, rows
 
+def _shown_flag():
+    # kitty/ide-min.py keeps /tmp/ide-<id>-shown-files present while the editor
+    # zone is on screen. Outside an IDE there is no flag to consult.
+    s = os.environ.get("KITTY_LISTEN_ON", "")
+    return f"/tmp/ide-{s.rsplit('ide.sock-', 1)[-1]}-shown-files" if "ide.sock-" in s else None
+
+SHOWN_FLAG = _shown_flag()
+
+def pane_shown():
+    return SHOWN_FLAG is None or os.path.exists(SHOWN_FLAG)
+
 def run_kitty(fd, cat_frames, zzz_frames):
     sys.stdout.write(f"{ESC}]2;content{ESC}\\{ESC}[?25l")  # title + hide cursor
     sys.stdout.flush()
@@ -166,6 +177,9 @@ def run_kitty(fd, cat_frames, zzz_frames):
         while True:
             t0 = time.monotonic()
             drain_stdin(fd)
+            if not pane_shown():          # editor zone minimized: draw nothing
+                time.sleep(0.5)
+                continue
             if resized["flag"]:
                 resized["flag"] = False
                 c, r, x, y, cols, rows = compute_geometry(fd)

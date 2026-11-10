@@ -66,9 +66,21 @@ ide-vd launch [--gpu] <cmd...>       # detached GUI app (stays running)
 ide-vd gl <cmd...>                   # run a GPU app via VirtualGL
 
 # manage the box
+ide-vd resize W H                    # resize the desktop's screen live
 ide-vd reset                         # destroy the container (clean slate)
 ide-vd commit [tag]                  # snapshot the configured box to an image
 ```
+
+## The desktop follows the pane
+
+The desktop's screen is not a fixed size: the feed pane asks the env to match
+its own pixel size (`ide-vd resize W H`) once a pane resize has settled, so the
+feed always fills the pane with no bars. This needs a resizable X server — the
+docker desktop runs **Xtigervnc** (X + VNC in one, RandR modes created on the
+fly by `vd-resize` in the container); images without it fall back to the old
+fixed-size Xvfb + x11vnc pair and the feed is letterboxed as before. Screen
+coordinates for `click`/`move` therefore depend on the current size — take a
+`shot` first. `IDE_VD_FIT=0` in the pane's environment keeps a fixed size.
 
 ## Senses (Claude can't take audio/video — only text + images)
 

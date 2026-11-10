@@ -48,16 +48,40 @@ cache="$cache_dir/md-$pathhash-$verhash.ansi"
 
 # -s dark: match the IDE's dark theme · -w: wrap to the pane width · less -R: keep
 # glow's ANSI colours. LESS=-R also avoids a stray "missing filename" if glow fails.
+#
+# glow (termenv) silently drops its colours whenever stdout is not a TTY — and
+# here it never is (we render into the cache file), so the view came out as bare
+# bold/underline text. Run glow under a pty via script(1) so it keeps the
+# style's full colours.
+#
+# On that pty termenv probes the terminal (OSC 10/11 fg/bg + CSI 6n cursor, the
+# 6n acting as a fence) and BLOCKS ~5s per unanswered probe — 15s of blank tab.
+# Nothing sits on the other side to answer, so we pre-feed one cursor-position
+# reply per probe through script's stdin: termenv reads the fence reply and
+# moves on instantly. The sed then strips the pty's \r line endings and all the
+# probe/reply bytes (replaying probes through less would make kitty answer them,
+# feeding stray input into less).
+render_md() {
+  if command -v script >/dev/null 2>&1; then
+    printf '\033[1;1R\033[1;1R\033[1;1R' \
+      | script -qec "$(printf '%q ' glow -s dark -w "$cols" -- "$file")" /dev/null 2>/dev/null \
+      | sed -e 's/\r$//' -e 's/\x1b\[1;1R//g' -e 's/\^\[\[1;1R//g' \
+            -e 's/\x1b\[6n//g' -e 's/\x1b]1[01];?\x1b\\//g' -e '1{/^$/d}'
+  else
+    CLICOLOR_FORCE=1 glow -s dark -w "$cols" -- "$file" 2>/dev/null   # 16-colour fallback
+  fi
+}
 if [ ! -s "$cache" ]; then
   rm -f "$cache_dir/md-$pathhash-"*.ansi 2>/dev/null || true   # drop stale renders of this file
   # Render to a temp then atomically rename, so a concurrent viewer never reads
   # a half-written cache (and two renders of the same key can't clobber).
   tmp="$cache.$$.tmp"
-  if glow -s dark -w "$cols" -- "$file" 2>/dev/null > "$tmp" && [ -s "$tmp" ]; then
+  render_md > "$tmp"
+  if [ -s "$tmp" ]; then
     mv -f "$tmp" "$cache"
   else
     rm -f "$tmp"
   fi
 fi
 if [ -s "$cache" ]; then less -R -- "$cache"
-else glow -s dark -w "$cols" -- "$file" 2>/dev/null | less -R; fi
+else render_md | less -R; fi

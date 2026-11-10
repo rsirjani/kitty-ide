@@ -16,6 +16,7 @@
 #   ide-vd type "text" | key <combo>
 #   ide-vd open <url> | run <cmd...> | launch [--gpu] <cmd...> | gl <cmd...>
 #   ide-vd reset | commit [tag]        destroy / snapshot the environment
+#   ide-vd resize W H                  resize the desktop's screen live
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -253,6 +254,14 @@ case "$cmd" in
     [ $# -ge 1 ] || die "usage: ide-vd $cmd [--gpu] <cmd...>"
     e="$(need_active)"; s="$(provider_script "$e")"
     "$s" "$act" "$(env_path "$e")" "${pre[@]}" "$@"
+    ;;
+
+  resize)
+    # Resize the desktop's screen live (docker env with Xtigervnc). The feed pane
+    # calls this to make the desktop match the pane's shape.
+    [ $# -eq 2 ] || die "usage: ide-vd resize <width> <height>"
+    e="$(need_active)"; s="$(provider_script "$e")"
+    "$s" run "$(env_path "$e")" vd-resize "$1" "$2"
     ;;
 
   reset)

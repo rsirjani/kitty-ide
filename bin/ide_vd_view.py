@@ -538,6 +538,76 @@ def card(size, title, lines, accent=MAUVE):
     return c
 
 
+# ---- fit the desktop to the pane ----------------------------------------------
+# The desktop's screen follows the pane's shape: once the pane size has been
+# stable for FIT_SETTLE seconds and differs from the desktop's, we ask the env
+# to resize (`ide-vd resize W H`). Only envs with a resizable X server support
+# it (docker + Xtigervnc); a failed attempt is remembered so we don't retry the
+# same size every frame. IDE_VD_FIT=0 turns it off (fixed-size desktop, letterboxed).
+FIT = os.environ.get("IDE_VD_FIT", "1") != "0"
+FIT_SETTLE = 0.6
+FIT_MIN = (320, 240)
+FIT_MAX = (2560, 1600)
+_fit_failed = None                      # last target the env refused
+
+
+def fit_target(size):
+    """Desktop size for a pane of `size` px: same shape, even dims, clamped."""
+    w, h = size
+    scale = min(1.0, FIT_MAX[0] / w, FIT_MAX[1] / h)
+    w, h = int(w * scale), int(h * scale)
+    w, h = max(FIT_MIN[0], w - w % 2), max(FIT_MIN[1], h - h % 2)
+    return w, h
+
+
+def request_fit(target):
+    """Blocking: ask the env to resize. True on success."""
+    global _fit_failed
+    try:
+        ok = subprocess.run(
+            ["ide-vd", "resize", str(target[0]), str(target[1])],
+            capture_output=True, text=True, timeout=15,
+        ).returncode == 0
+    except Exception:
+        ok = False
+    _fit_failed = None if ok else target
+    return ok
+
+
+# ---- minimized pane ------------------------------------------------------------
+# The vd pane starts minimized (kitty/ide-min.py) and opens when something opens
+# in the desktop: the feed asks for it the moment a real frame shows up, and lets
+# it close again once the desktop has been blank/down for a few seconds. `--auto`
+# means a pane the user opened by hand is left alone. While minimized the feed
+# paints nothing (the pane is not on screen) but keeps watching the desktop.
+def _shown_flag():
+    s = os.environ.get("KITTY_LISTEN_ON", "")
+    return f"/tmp/ide-{s.rsplit('ide.sock-', 1)[-1]}-shown-vd" if "ide.sock-" in s else None
+
+
+SHOWN_FLAG = _shown_flag()              # None outside an IDE -> always "shown"
+AUTO_HIDE_AFTER = 3.0                   # seconds of blank desktop before closing
+_auto_state = None
+
+
+def pane_shown():
+    return SHOWN_FLAG is None or os.path.exists(SHOWN_FLAG)
+
+
+def pane_auto(show):
+    """Ask the IDE to open/close the vd pane; a no-op unless the wish changed."""
+    global _auto_state
+    if SHOWN_FLAG is None or show == _auto_state:
+        return
+    _auto_state = show
+    try:
+        subprocess.Popen(["ide-min", "show" if show else "hide", "vd", "--auto"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def resolve():
     """Ask the CLI for the active endpoint.
 
@@ -683,13 +753,45 @@ async def stream(host, port, password, size_ref):
         last_size = None
         last_seq = -1
         last_resolve = loop.time()
+        settle_size, settle_at = None, loop.time()
+        blank_since = None
         try:
             while True:
                 if not state["alive"]:          # VNC dropped inside capture
                     raise ConnectionError("vnc capture ended")
                 size = pane_pixels()
 
+                # Something on the desktop -> open the pane; blank for a while
+                # -> let it close again.
                 if state["blank"] or state["rgb"] is None:
+                    if blank_since is None:
+                        blank_since = loop.time()
+                    elif loop.time() - blank_since >= AUTO_HIDE_AFTER:
+                        pane_auto(False)
+                else:
+                    blank_since = None
+                    pane_auto(True)
+                shown = pane_shown()
+
+                # Fit the desktop to the pane once the pane size has settled.
+                # On success the server drops us (new framebuffer size), so
+                # return and let main() reconnect at the new size.
+                if FIT and shown:
+                    if size != settle_size:
+                        settle_size, settle_at = size, loop.time()
+                    target = fit_target(size)
+                    if (target != (client.video.width, client.video.height)
+                            and target != _fit_failed
+                            and loop.time() - settle_at >= FIT_SETTLE):
+                        if await asyncio.to_thread(request_fit, target):
+                            return
+
+                if not shown:
+                    # Minimized: nothing to paint. Forget what was drawn so the
+                    # first frame after a restore is painted unconditionally.
+                    last_size, settle_size = None, None
+                    await asyncio.sleep(0.25)
+                elif state["blank"] or state["rgb"] is None:
                     if pending is not None:     # don't let a live blit race the idle one
                         await pending
                         pending = None
@@ -734,7 +836,13 @@ async def animate_idle(still_matches):
     fps = IDLE_VIDEO_FPS if _load_idle_frames() else IDLE_FPS
     tick = 0
     period = 1.0 / fps
+    pane_auto(False)                    # no desktop running: nothing to show
     while True:
+        if not pane_shown():            # minimized: just watch for the env to change
+            await asyncio.sleep(1.0)
+            if not still_matches(resolve()):
+                return
+            continue
         blit(render_idle_image(pane_pixels(), tick))
         tick += 1
         await _sleep_or_resize(period)              # wake at once on a pane resize
@@ -744,7 +852,11 @@ async def animate_idle(still_matches):
 
 
 async def main():
-    sys.stdout.write("\x1b[?25l")             # hide cursor
+    # Alternate screen: it has no scrollback. On the main screen a frame sized
+    # for the pane's previous (taller) shape, drawn in the instant after the pane
+    # shrank, scrolled the terminal -- thousands of blank scrollback lines, a
+    # scrollbar, and a feed you could scroll away.
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")  # alt screen + hide cursor
     sys.stdout.flush()
     global RESIZE_EVT
     RESIZE_EVT = asyncio.Event()
@@ -780,7 +892,7 @@ async def main():
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write("\x1b[?25h")
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
 
 

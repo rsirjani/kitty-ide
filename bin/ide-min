@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Minimize / restore an IDE pane:
+#   ide-min show|hide|toggle explorer|vd|files [--auto]
+#   ide-min --pid <kitty pid> …      a specific IDE (the Waybar buttons use this)
+# --auto = the IDE doing it on its own (something opened in the pane / the last
+# thing in it closed); see kitty/ide-min.py for the rules.
+export PATH="$HOME/.local/bin:$PATH"
+if [ "${1:-}" = --pid ]; then
+  sock="unix:/tmp/ide.sock-$2"; shift 2
+else
+  . ide-sock
+fi
+exec kitty @ --to "$sock" action kitten ide-min.py "$@" >/dev/null 2>&1

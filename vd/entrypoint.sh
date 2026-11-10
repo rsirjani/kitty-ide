@@ -16,7 +16,43 @@ rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" 2>/dev/null 
 mkdir -p /run/dbus && rm -f /run/dbus/pid 2>/dev/null || true
 dbus-daemon --system --fork 2>/dev/null || true
 
-Xvfb "$DISPLAY" -screen 0 "$GEOMETRY" -ac +extension GLX +extension RANDR +render -noreset &
+# VNC auth: the run command already binds the host port to 127.0.0.1, but we add
+# a password as defense-in-depth so a misconfigured port mapping (e.g. -p
+# 5901:5901, host networking) can't expose a passwordless desktop. Generate one
+# per container; store the plaintext on the shared volume so the host-side
+# provider can hand it to clients, and an x11vnc hash for -rfbauth. (Classic VNC
+# auth uses only the first 8 chars, so the secret is exactly 8.)
+mkdir -p /vdshare
+if [ ! -s /vdshare/.vncpass ]; then
+  head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 8 > /vdshare/.vncpass
+fi
+auth_args="-nopw"
+if x11vnc -storepasswd "$(cat /vdshare/.vncpass)" /tmp/.vncpasswd >/dev/null 2>&1 \
+   && [ -s /tmp/.vncpasswd ]; then
+  auth_args="-rfbauth /tmp/.vncpasswd"
+else
+  echo "entrypoint: WARNING: x11vnc -storepasswd failed; serving WITHOUT a VNC" \
+       "password (relying on the 127.0.0.1 host port binding only)" >&2
+fi
+
+# X server. Preferred: Xtigervnc — an X server with a built-in VNC server whose
+# screen can be resized live (`vd-resize W H`, below), so the desktop can follow
+# the shape of the IDE's feed pane. Xvfb cannot change size after start, so it
+# (with x11vnc on top) is only the fallback for images without tigervnc.
+geom_wh="${GEOMETRY%x*}"               # WxHxDEPTH -> WxH
+XSERVER=xvfb
+if command -v Xtigervnc >/dev/null 2>&1; then
+  XSERVER=tigervnc
+  if [ "$auth_args" = "-nopw" ]; then vnc_sec="-SecurityTypes None"
+  else vnc_sec="-SecurityTypes VncAuth -PasswordFile /tmp/.vncpasswd"; fi
+  # -localhost=0: docker's port proxy must reach it (host side binds 127.0.0.1).
+  Xtigervnc "$DISPLAY" -geometry "$geom_wh" -depth 24 \
+    -rfbport "$VNC_PORT" -localhost=0 $vnc_sec -AlwaysShared \
+    -ac +extension GLX +render -noreset >/tmp/xtigervnc.log 2>&1 &
+  XPID=$!
+else
+  Xvfb "$DISPLAY" -screen 0 "$GEOMETRY" -ac +extension GLX +extension RANDR +render -noreset &
+fi
 
 # Wait for the X server to accept connections before starting clients.
 for _ in $(seq 1 100); do
@@ -26,6 +62,24 @@ done
 
 xsetroot -solid "$VD_BG" 2>/dev/null || true
 openbox &
+
+# Live resize (Xtigervnc only): `vd-resize W H` switches the screen to an
+# arbitrary size via a RandR mode created on the fly. The feed pane calls this
+# (through `ide-vd resize`) so the desktop matches the pane's shape; VNC clients
+# without resize support are dropped by the server and simply reconnect.
+cat > /usr/local/bin/vd-resize <<'EOF'
+#!/bin/sh
+export DISPLAY="${DISPLAY:-:99}"
+W="$1"; H="$2"
+case "$W$H" in ''|*[!0-9]*) echo "usage: vd-resize W H" >&2; exit 2;; esac
+out=$(xrandr 2>/dev/null | awk '/ connected/{print $1; exit}')
+[ "$out" = "VNC-0" ] || { echo "vd-resize: X server is not resizable (need Xtigervnc)" >&2; exit 3; }
+n="${W}x${H}"
+xrandr --newmode "$n" 0 "$W" "$W" "$W" "$W" "$H" "$H" "$H" "$H" 2>/dev/null
+xrandr --addmode "$out" "$n" 2>/dev/null
+xrandr --output "$out" --mode "$n"
+EOF
+chmod +x /usr/local/bin/vd-resize
 
 # Default browser wrapper: the container runs as root, so Chromium refuses to
 # start without --no-sandbox. Apps that call shell.openExternal()/xdg-open (e.g.
@@ -80,23 +134,11 @@ PA
 pulseaudio --system -n --file=/tmp/vd-pulse.pa --exit-idle-time=-1 --disallow-exit -D 2>/dev/null || true
 for _ in $(seq 1 50); do [ -S /tmp/pulse-native ] && break; sleep 0.1; done
 
-# VNC auth: the run command already binds the host port to 127.0.0.1, but we add
-# a password as defense-in-depth so a misconfigured port mapping (e.g. -p
-# 5901:5901, host networking) can't expose a passwordless desktop. Generate one
-# per container; store the plaintext on the shared volume so the host-side
-# provider can hand it to clients, and an x11vnc hash for -rfbauth. (Classic VNC
-# auth uses only the first 8 chars, so the secret is exactly 8.)
-mkdir -p /vdshare
-if [ ! -s /vdshare/.vncpass ]; then
-  head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 8 > /vdshare/.vncpass
-fi
-auth_args="-nopw"
-if x11vnc -storepasswd "$(cat /vdshare/.vncpass)" /tmp/.vncpasswd >/dev/null 2>&1 \
-   && [ -s /tmp/.vncpasswd ]; then
-  auth_args="-rfbauth /tmp/.vncpasswd"
-else
-  echo "entrypoint: WARNING: x11vnc -storepasswd failed; serving WITHOUT a VNC" \
-       "password (relying on the 127.0.0.1 host port binding only)" >&2
+if [ "$XSERVER" = tigervnc ]; then
+  # Xtigervnc already serves VNC; just stay alive as PID 1 and stop it cleanly.
+  trap 'kill "$XPID" 2>/dev/null; exit 0' TERM INT
+  wait "$XPID"
+  exit $?
 fi
 
 # x11vnc serves the live display. It must -listen on 0.0.0.0 *inside* the

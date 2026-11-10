@@ -15,6 +15,7 @@ reap_instance() {  # drop all per-instance state + VD container(s) for a dead pi
   rm -rf "/tmp/ide.sock-${pid}" "/tmp/ide-${pid}-active-doc" \
     "/tmp/ide-${pid}-explorer-cwd" "/tmp/ide-${pid}-tabs-dirty" \
     "/tmp/ide-${pid}-render" "/tmp/ide-${pid}-loprofile" \
+    "/tmp/ide-${pid}-shown-explorer" "/tmp/ide-${pid}-shown-vd" "/tmp/ide-${pid}-shown-files" \
     "$HOME/.local/share/ide-carbonyl/${pid}" 2>/dev/null || true
 }
 
@@ -92,6 +93,7 @@ trap '
     rm -f "$pf" "$pf.port" 2>/dev/null
   done
   rm -rf "/tmp/ide-${kpid}-render" "/tmp/ide-${kpid}-loprofile" \
+    "/tmp/ide-${kpid}-shown-explorer" "/tmp/ide-${kpid}-shown-vd" "/tmp/ide-${kpid}-shown-files" \
     "$HOME/.local/share/ide-carbonyl/${kpid}" 2>/dev/null
   true' EXIT
 wait "$kpid"

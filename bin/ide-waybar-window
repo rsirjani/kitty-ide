@@ -48,20 +48,49 @@ def chat_title(pid):
                 return title if title and title.lower() != "claude" else None
     return None
 
-def label():
+def monitor_window(which):
+    """The active-workspace last-focused window on monitor `which`
+    (an explicit output name, or "external" = first non-eDP monitor)."""
     try:
-        d = json.loads(run("hyprctl", "activewindow", "-j") or "{}")
+        monitors = json.loads(run("hyprctl", "monitors", "-j") or "[]")
+        workspaces = json.loads(run("hyprctl", "workspaces", "-j") or "[]")
+        clients = json.loads(run("hyprctl", "clients", "-j") or "[]")
     except Exception:
-        d = {}
+        return {}
+    if which == "external":
+        mon = next((m for m in monitors if not m.get("name", "").startswith("eDP")), None)
+    else:
+        mon = next((m for m in monitors if m.get("name") == which), None)
+    if not mon:
+        return {}
+    ws_id = (mon.get("activeWorkspace") or {}).get("id")
+    ws = next((w for w in workspaces if w.get("id") == ws_id), None)
+    if not ws:
+        return {}
+    addr = ws.get("lastwindow", "")
+    return next((c for c in clients if c.get("address") == addr), {})
+
+def label(which):
+    if which is None:
+        # no argument: the globally focused window (single-monitor behavior)
+        try:
+            d = json.loads(run("hyprctl", "activewindow", "-j") or "{}")
+        except Exception:
+            d = {}
+    else:
+        d = monitor_window(which)
     title = d.get("title", "") or ""
     if d.get("class") == "ide" and d.get("pid"):
         title = chat_title(d["pid"]) or title    # fall back to "IDE" if no chat
     return pango_escape(title)
 
 def main():
+    which = sys.argv[1] if len(sys.argv) > 1 else None
+    if which == "output":    # the monitor this bar is on (set by waybar)
+        which = os.environ["WAYBAR_OUTPUT_NAME"]
     last = None
     while True:
-        cur = label()
+        cur = label(which)
         if cur != last:
             sys.stdout.write(cur + "\n"); sys.stdout.flush()
             last = cur

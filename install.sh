@@ -22,6 +22,8 @@ link "$REPO/kitty/ide-pin-tabbar.py" "$HOME/.config/kitty/ide-pin-tabbar.py"
 link "$REPO/kitty/ide-seldel.py"     "$HOME/.config/kitty/ide-seldel.py"
 link "$REPO/kitty/ide-click.py"      "$HOME/.config/kitty/ide-click.py"
 link "$REPO/kitty/ide_caret.py"      "$HOME/.config/kitty/ide_caret.py"
+link "$REPO/kitty/ide-min.py"        "$HOME/.config/kitty/ide-min.py"
+link "$REPO/kitty/ide-copy.py"       "$HOME/.config/kitty/ide-copy.py"
 link "$REPO/kitty/patches/apply-fixed-lines-patch.py" "$HOME/.config/kitty/patches/apply-fixed-lines-patch.py"
 
 echo "==> yazi config -> ~/.config/yazi-ide"
@@ -118,6 +120,10 @@ Notes:
    video/audio→mpv, csv/xlsx→visidata, docx/pptx→LibreOffice PDF, pdf→tdf, else
    nvim. Press Alt+M (or click the tab-bar ⇄) to morph rendered⇄editable.
  - PDF tabs use `tdf`; editing uses `nvim`.
+ - Waybar pane buttons (optional): `ide-waybar-panes config > ~/.config/waybar/ide-panes.jsonc`,
+   add that file to the bar's "include", and put "group/ide-explorer", "group/ide-vd",
+   "group/ide-files", "custom/ide-panes" in a modules list. Style the `.ide-pane`
+   class (`.open` / `.min` / `.entry`).
  - Virtual Desktop: `ide-vd up` starts the Docker desktop; the vd pane shows it
    live, and Claude drives it with `ide-vd shot/click/type/key`, sees motion with
    `rec`, hears sound with `hear`, and runs GPU apps with `gl`. See vd/README.md.

@@ -68,6 +68,20 @@ def snapshot():
                     tb_dims = (win.get("lines"), win.get("columns"))
     return docs, tb_dims
 
+def with_fallback_focus(docs):
+    """focus_follows_mouse steals focus from the doc the moment the pointer
+    enters the tab bar — which used to drop the active highlight and hide the
+    ⇄ morph button right as the user reached for it. When no doc is focused,
+    treat the remembered active doc as focused so the bar stays stable under
+    the pointer."""
+    if not docs or any(d[2] for d in docs):
+        return docs
+    try:
+        aid = open(ACTIVE_DOC).read().strip()
+    except Exception:
+        return docs
+    return [(i, t, str(i) == aid, v, f) for (i, t, _, v, f) in docs]
+
 def pin_one_row(tb_lines):
     """Keep the tab bar exactly one row tall; give the freed space to the editor."""
     if tb_lines and tb_lines > 1:
@@ -190,9 +204,21 @@ def main():
     sys.stdout.write("\033[?1000;1006h")          # SGR mouse reporting
     sys.stdout.flush()
     last, last_dims, ranges, buf = None, None, [], ""
+    had_docs, empty_polls = False, 0
     while True:
-        r, _, _ = select.select([sys.stdin], [], [], 0.1)
+        r, _, _ = select.select([sys.stdin], [], [], 0.5)
         cur, tb_dims = snapshot()
+        cur = with_fallback_focus(cur)
+        # The last tab closed -> minimize the editor zone again (only if it was
+        # opened by a document; see ide-min). Wait for two empty polls so the
+        # close+reopen of a morph (⇄) doesn't count as "empty".
+        if cur:
+            had_docs, empty_polls = True, 0
+        elif had_docs:
+            empty_polls += 1
+            if empty_polls >= 2:
+                had_docs = False
+                subprocess.Popen(["ide-min", "hide", "files", "--auto"])
         if tb_dims != last_dims:                  # the bar was resized
             pin_one_row(tb_dims[0])               # snap it back to one row
             last_dims = tb_dims

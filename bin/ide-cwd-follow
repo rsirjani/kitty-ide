@@ -11,6 +11,7 @@
 export PATH="$HOME/.local/bin:$PATH"
 . ide-sock                   # -> sock, IDE_CWD_FILE for THIS instance
 CWDFILE="$IDE_CWD_FILE"
+MNT_BASE="/tmp/ide-${IDE_ID}-remote"   # ide-remote-follow's sshfs mounts
 sockpath="${sock#unix:}"     # the control socket's filesystem path
 last=""
 
@@ -21,6 +22,69 @@ while true; do
     dir="$(cat "$CWDFILE" 2>/dev/null)"
     if [ -n "$dir" ] && [ "$dir" != "$last" ] && [ -d "$dir" ]; then
       last="$dir"
+
+      # --- remote follow-back: the explorer is inside this instance's sshfs
+      # mount of a remote home (ide-remote-follow). Translate the mount path
+      # back to a remote ~-relative one and type the cd into the ssh session
+      # itself. Gated like local cds but STRICTER: the remote prompt must
+      # carry kitty shell-integration marks (kitten ssh provides them) proving
+      # an empty prompt -- without marks a remote vim/less is indistinguishable
+      # from a prompt, so we send nothing.
+      if [[ "$dir" == "$MNT_BASE"/* ]]; then
+        rel="${dir#"$MNT_BASE"/}"; dest="${rel%%/*}"
+        sub="${rel#"$dest"}"; sub="${sub#/}"
+        ok=$(kitty @ --to "$sock" ls 2>/dev/null | DEST="$dest" python3 -c '
+import sys, json, os
+dest = os.environ["DEST"]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("0"); sys.exit()
+for w in data:
+    for t in w["tabs"]:
+        for win in t["windows"]:
+            if win.get("user_vars", {}).get("pane") != "claude":
+                continue
+            fps = win.get("foreground_processes", [])
+            if not fps:
+                print("0"); sys.exit()
+            names = {os.path.basename((p.get("cmdline") or [""])[0]).lstrip("-") for p in fps}
+            if not names <= {"ssh", "kitten"}:   # anything else in front = busy
+                print("0"); sys.exit()
+            args = [a for p in fps for a in (p.get("cmdline") or [])]
+            print("1" if any(a == dest or a.endswith("@" + dest) for a in args) else "0")
+            sys.exit()
+print("0")
+')
+        if [ "$ok" = "1" ]; then
+          typed=$(kitty @ --to "$sock" get-text --match var:pane=claude --extent=screen --ansi 2>/dev/null | python3 -c '
+import sys, re
+s = sys.stdin.read()
+am = list(re.finditer(r"\x1b\]133;A", s))
+if not am:
+    print("TYPED"); sys.exit()              # no marks over ssh -> never type
+region = s[am[-1].end():]
+region = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", region)
+region = re.sub(r"\x1b\[[0-9;:?]*[ -/]*[@-~]", "", region)
+region = re.sub(r"\x1b[()][0-9A-Za-z]", "", region)
+region = region.replace("\x1b\\", "")
+SYMS = "$%#>❯➜λ⛩»→▶฿"
+idx = max((i for i, ch in enumerate(region) if ch in SYMS), default=-1)
+buf = region[idx+1:] if idx >= 0 else region
+print("TYPED" if buf.strip() else "EMPTY")
+')
+          if [ "$typed" = "EMPTY" ]; then
+            if [ -n "$sub" ]; then
+              kitty @ --to "$sock" send-text --match var:pane=claude " cd -- ~/${sub@Q}"$'\r' >/dev/null 2>&1
+            else
+              kitty @ --to "$sock" send-text --match var:pane=claude " cd ~"$'\r' >/dev/null 2>&1
+            fi
+          fi
+        fi
+        sleep 0.3
+        continue
+      fi
+
       # Stage 1: is the claude pane an idle bare shell sitting at a different dir?
       do_cd=$(kitty @ --to "$sock" ls 2>/dev/null | DIR="$dir" python3 -c '
 import sys, json, os

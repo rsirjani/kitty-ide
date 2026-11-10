@@ -5,23 +5,31 @@ export PATH="$HOME/.local/bin:$PATH"
 action="${1:-next}"
 
 if [ "$action" = "close" ]; then
-  # close the focused document overlay, then focus the previous tab if any
+  # close the focused document overlay, then focus the previous tab if any.
+  # No doc focused (focus_follows_mouse parked the pointer elsewhere) -> fall
+  # back to the remembered active doc. nxt prints as '-' when there is no next
+  # tab, so an empty field can never shift the pids into \$nextid.
   read -r closed nextid pids < <(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
 import sys,json
-ids=[]; foc=None; fg=[]
+active=''
+try: active=open(sys.argv[1]).read().strip()
+except Exception: pass
+ids=[]; foc=None; fgmap={}
 for w in json.load(sys.stdin):
  for t in w['tabs']:
   for win in t['windows']:
    if win.get('user_vars',{}).get('doc')=='1':
     ids.append(win['id'])
-    if win.get('is_focused'):
-     foc=win['id']
-     fg=[str(p['pid']) for p in win.get('foreground_processes',[]) if p.get('pid')]
+    fgmap[win['id']]=[str(p['pid']) for p in win.get('foreground_processes',[]) if p.get('pid')]
+    if win.get('is_focused'): foc=win['id']
+if foc is None:
+ foc=next((x for x in ids if str(x)==active), None)
 if foc in ids:
  i=ids.index(foc); rest=[x for x in ids if x!=foc]
- nxt=rest[i-1] if rest else ''
- print(foc, nxt, ','.join(fg))
-")
+ nxt=rest[i-1] if rest else '-'
+ print(foc, nxt, ','.join(fgmap.get(foc,[])))
+" "$IDE_ACTIVE_DOC")
+  [ "$nextid" = "-" ] && nextid=""
   if [ -n "$closed" ]; then
     kitty @ --to "$sock" close-window --match "id:$closed" >/dev/null 2>&1
     # reap the closed window's process group(s) so a carbonyl tab's Chromium
@@ -45,6 +53,9 @@ fi
 
 target=$(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
 import sys,json
+active=''
+try: active=open(sys.argv[1]).read().strip()
+except Exception: pass
 ids=[]; foc=None
 for w in json.load(sys.stdin):
  for t in w['tabs']:
@@ -52,11 +63,13 @@ for w in json.load(sys.stdin):
    if win.get('user_vars',{}).get('doc')=='1':
     ids.append(win['id'])
     if win.get('is_focused'): foc=win['id']
+if foc is None:  # focus_follows_mouse parked focus elsewhere -> use active doc
+ foc=next((x for x in ids if str(x)==active), None)
 if not ids: print(''); raise SystemExit
 a='$action'
 if a=='next': i=(ids.index(foc)+1)%len(ids) if foc in ids else 0
 elif a=='prev': i=(ids.index(foc)-1)%len(ids) if foc in ids else 0
 else: i=int(a)-1 if a.isdigit() and 0<int(a)<=len(ids) else 0
 print(ids[i])
-")
+" "$IDE_ACTIVE_DOC")
 [ -n "$target" ] && { kitty @ --to "$sock" focus-window --match "id:$target" >/dev/null 2>&1; echo "$target" > "$IDE_ACTIVE_DOC"; }

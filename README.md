@@ -57,10 +57,24 @@ scripts.
 - **Fixed tab bar** — the tab strip is locked to exactly one row via a kitty
   layout patch; its border can't resize it, but the explorer/editor border still
   does. The tab bar + editor highlight as **one box** when focused.
+- **Minimizable panes** — the IDE starts with just the explorer and claude. The
+  editor zone opens when a document opens in it and closes with its last tab;
+  the desktop feed opens when an app is up in the Virtual Desktop and closes when
+  the desktop goes blank. Any pane (explorer, desktop, files) can also be
+  minimized or restored by hand from **Waybar buttons** that appear only on a
+  monitor whose current workspace has an IDE — with several IDEs on one
+  workspace each button becomes a drawer listing them. A minimized pane gives
+  its space to its neighbours, and a pane you opened by hand is never closed
+  automatically.
 - **Claude chat-title header** — a one-row strip above the claude pane shows the
   title of the current chat (Claude Code's AI-generated session summary), so with
   many workspaces you can tell at a glance what each is working on. The same
   title also replaces the static "IDE" label in Waybar for the focused window.
+- **Clean copies out of the claude chat** — Claude Code wraps its output to the
+  pane width with real newlines, so a plain copy pastes as a ragged block.
+  Anything copied from the claude pane (select-to-copy, `Ctrl+C`, middle click)
+  is re-flowed first: wrapped paragraphs become single lines, the `●` bullet
+  and the indent go, while code, lists, tables and tool output keep their shape.
 - **Select-to-delete in the claude chat** — highlight text in Claude Code's
   input box with the mouse and press backspace/delete to remove it, like a GUI
   editor. A kitten walks the (hidden but caret-tracking) terminal cursor
@@ -94,6 +108,16 @@ scripts.
   in the top-left feed pane. Claude gets **eyes** (`ide-vd shot`) and **hands**
   (`ide-vd click/type/key`) to drive a real GUI in an act→observe loop, so
   front-end work can be *seen*, not just logged. See [`vd/`](vd/).
+- **A shared whiteboard Claude can draw on** — `ide-wb open` serves an
+  [Excalidraw](https://excalidraw.com) board (as a carbonyl tab, or `ide-wb vd`
+  for real-mouse drawing in the Virtual Desktop). The board has two layers:
+  whatever the user draws by hand, and a layer Claude generates by editing
+  `~/.local/state/ide-wb/board.mmd` (a mermaid flowchart — no coordinates, the
+  page renders and lays it out live, parse errors land in `board.mmd.err`).
+  `alt+b` pastes "board updated — read board.png" into the claude pane, so
+  Claude *sees* the drawing with vision; every change auto-exports that PNG.
+  User freehand and Claude's diagram merge on one canvas without clobbering
+  each other. See [`wb/`](wb/).
 - **Idle animation** — a looping ASCII sleeping cat when no document is open.
 - **Catppuccin Mocha** throughout.
 
@@ -127,9 +151,14 @@ to `IgnorePkg` so the patch survives upgrades.
 | `kitty/ide-pin-tabbar.py` | watcher fallback that keeps a fixed strip (tab bar, claude header) one row |
 | `bin/ide-claude-header` | the one-row strip above claude that shows the current chat title |
 | `bin/ide-waybar-window` | Waybar module: focused window's title, or the chat title for IDE windows |
+| `kitty/ide-copy.py` | re-flows text copied from the claude pane (runtime hook on kitty's selection text) |
+| `kitty/ide-min.py` | minimizable panes: the runtime hook on kitty's splits layout (watcher) + the show/hide/toggle kitten |
+| `bin/ide-min` | CLI for the above: `ide-min show\|hide\|toggle explorer\|vd\|files [--auto]` |
+| `bin/ide-waybar-panes` | Waybar pane buttons: one poller + the module definitions (`ide-waybar-panes config`) |
 | `kitty/patches/` | the idempotent re-applier for the kitty splits-layout patch |
 | `yazi/` | the explorer's yazi config + the `cd`-broadcast hook |
 | `vd/` | the virtual-desktop subsystem — Dockerfile, env registry, provider docs (see [`vd/README.md`](vd/README.md)) |
+| `wb/` · `bin/ide-wb` | the shared user↔Claude whiteboard — Excalidraw wrapper page, file-backed server, CLI |
 | `pacman/` | hook that re-applies the kitty patch after a kitty reinstall |
 | `carbonyl/` | the crisp-browser patch (diff + notes; upstream PRs linked) |
 | `docs/` | architecture & internals, known gaps |
@@ -139,11 +168,16 @@ to `IgnorePkg` so the patch survives upgrades.
 **Panes** — hover to focus, or:
 - `Ctrl+Shift+←/→` previous / next pane
 - `Ctrl+Shift+E` explorer · `Ctrl+Shift+V` desktop feed · `Ctrl+Shift+.` editor · `Ctrl+Shift+T` terminal
+  (naming a minimized pane restores it; previous / next skip minimized panes)
+- minimize / restore a pane: the Waybar buttons, or `ide-min toggle explorer|vd|files`
 
 **Tabs** (editor zone):
 - `Alt+]` / `Alt+[` next / previous tab · `Alt+1…9` jump to tab
 - `Alt+W` close the active tab · click a tab or its `×` · click `+ web`
 - `Alt+M` morph the active tab between rendered view and editable · click the `⇄`
+
+**Whiteboard**:
+- `Alt+Shift+B` open the shared board as a tab · `Alt+B` tell Claude to look at it
 
 **Explorer** — single-click selects, **double-click activates**: opens a file as
 a tab or enters a directory (same as pressing Enter). **Right-click** copies the

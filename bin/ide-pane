@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# Switch focus between IDE panes:  ide-pane explorer | editor | claude | next | prev
+# Switch focus between IDE panes:  ide-pane explorer | vd | editor | claude | next | prev
 # "editor" focuses the active document overlay (tracked in /tmp/ide-active-doc).
+# Naming a pane restores it if it is minimized; next/prev step over minimized ones.
 export PATH="$HOME/.local/bin:$PATH"
 . ide-sock   # -> sock, IDE_ACTIVE_DOC for THIS instance
-curpane=$(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
+read -r curpane hidden < <(kitty @ --to "$sock" ls 2>/dev/null | python3 -c "
 import sys,json
+cur=''; hidden=set()
 for w in json.load(sys.stdin):
  for t in w['tabs']:
   for win in t['windows']:
-   if win.get('is_focused'):
     v=win.get('user_vars',{}); p=v.get('pane','')
-    if v.get('doc')=='1' or p in ('content','tabbar'): p='editor'
-    print(p); raise SystemExit
-print('')
+    if v.get('minimized')=='1': hidden.add('editor' if p in ('content','tabbar') else p)
+    if win.get('is_focused'):
+     if v.get('doc')=='1' or p in ('content','tabbar'): p='editor'
+     cur=p
+print(cur or '-', ','.join(sorted(hidden)) or '-')
 ")
-order=(explorer vd editor claude); n=${#order[@]}; idx=0
+order=()
+for p in explorer vd editor claude; do
+  case ",$hidden," in (*",$p,"*) ;; (*) order+=("$p") ;; esac
+done
+n=${#order[@]}; idx=0
 for i in "${!order[@]}"; do [ "${order[$i]}" = "$curpane" ] && idx=$i; done
 case "$1" in
   next) target="${order[$(((idx+1)%n))]}" ;;
   prev) target="${order[$(((idx+n-1)%n))]}" ;;
   *)    target="$1" ;;
+esac
+case "$target" in
+  explorer|vd) ide-min show "$target" ;;
+  editor)      ide-min show files ;;
 esac
 if [ "$target" = editor ]; then
   doc="$(cat "$IDE_ACTIVE_DOC" 2>/dev/null)"

@@ -214,38 +214,59 @@ edit_in_vd() {
   esac
 }
 
-# Report the focused doc as: <id>\t<vmode>\t<file>
+# Report the focused doc as: <id>\t<vmode>\t<file>. With focus_follows_mouse,
+# hovering the tab bar to click its ⇄ button moves focus to the TABBAR before
+# the toggle runs, so at that instant no doc is focused — fall back to the
+# remembered active doc so the toggle still lands on the right tab.
 focused_doc() {
   kitty @ --to "$sock" ls 2>/dev/null | python3 -c '
 import sys, json
+active = ""
+try: active = open(sys.argv[1]).read().strip()
+except Exception: pass
+fallback = None
 for w in json.load(sys.stdin):
   for t in w["tabs"]:
     for win in t["windows"]:
       v = win.get("user_vars", {})
-      if v.get("doc") == "1" and win.get("is_focused"):
-        print("%s\t%s\t%s" % (win["id"], v.get("vmode", ""), v.get("file", "")))
-        raise SystemExit
-'
+      if v.get("doc") != "1": continue
+      row = "%s\t%s\t%s" % (win["id"], v.get("vmode", ""), v.get("file", ""))
+      if win.get("is_focused"):
+        print(row); raise SystemExit
+      if str(win["id"]) == active: fallback = row
+if fallback: print(fallback)
+' "$IDE_ACTIVE_DOC"
 }
 
 close_doc() { kitty @ --to "$sock" close-window --match "id:$1" >/dev/null 2>&1; }
 
-# Flip the focused tab between rendered view and editable.
+# Flip the focused tab between rendered view and editable. NB: the doc's window
+# id is deliberately NOT named `id` here — launch_overlay reports the NEW window
+# through the global `id`, and a `local id` would shadow it (bash dynamic
+# scoping), leaving the active-doc file pointing at the closed window.
 do_toggle() {
-  local line id vmode file; line="$(focused_doc)"
-  IFS=$'\t' read -r id vmode file <<<"$line"
+  local line wid vmode file; line="$(focused_doc)"
+  IFS=$'\t' read -r wid vmode file <<<"$line"
   [ -n "$file" ] || exit 0           # browser tab / nothing focused -> no-op
   local cat; cat="$(category_of "$file")"
   case "$cat" in video|audio|pdf) exit 0;; esac   # no editable counterpart
   if [ "$vmode" = view ]; then
     case "$cat" in
       sheet|document|slides) edit_in_vd "$file" ;;  # leaves the view tab open
-      *)                     close_doc "$id"; do_edit "$file" ;;
+      *)                     close_doc "$wid"; do_edit "$file" ;;
     esac
   else
-    close_doc "$id"; do_view "$file"
+    close_doc "$wid"; do_view "$file"
   fi
 }
+
+# The editor zone starts minimized: restore it before the document lands (so the
+# overlay is created at its real size). --auto lets it close again with its
+# last tab unless the user opened it by hand.
+case "$mode" in
+  open|view|edit|pdf) [ -n "$arg" ] && ide-min show files --auto ;;
+  browser|toggle)     ide-min show files --auto ;;
+esac
 
 case "$mode" in
   open)    do_open "$arg" ;;
