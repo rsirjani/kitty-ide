@@ -23,13 +23,15 @@
 from kitty.fast_data_types import add_timer, click_mouse_url
 
 import ide_caret
-if getattr(ide_caret, 'VERSION', 0) < 3:   # kitty caches the module: pick up fixes live
+if getattr(ide_caret, 'VERSION', 0) < 5:   # kitty caches the module: pick up fixes live
     import importlib
     importlib.reload(ide_caret)
-from ide_caret import TEXT_COL, input_rows, presses_between, row_len_cells, snap_to_cluster, visual_rows
+from ide_caret import TEXT_COL, cell_width, input_rows, row_keys, row_len_cells, snap_to_cluster, visual_rows
 
 TICK = 0.008            # seconds between cursor polls
-PRESS_WAIT = 0.09       # a press not dragged into a selection by then is a click
+PRESS_WAIT = 0.09       # no button state available: a press not dragged by then is a click
+HOLD_IS_CLICK = 0.3     # button still held this long without the pointer moving: a click
+GIVE_UP = 0.7           # still held and moving: it's a drag, leave it alone
 REST_TICKS = 6          # cursor still this long on target => arrived
 CORRECT_REST_TICKS = 40 # still this long OFF target => burst is spent, correct
 SETTLE_TICKS = 150      # burst never came to rest => give up
@@ -40,6 +42,54 @@ MAX_PRESSES = 4000      # absolute cap on synthesized keypresses per click
 # kitty re-executes a custom kitten's file on every invocation, so module state
 # doesn't survive from one click to the next.
 BUSY_ATTR = 'ide_click_busy'
+
+
+def _button_down(boss):
+    """Is a pointer button (or a touchpad contact) physically held right now?
+    True / False, or None when the input devices can't be read (not in the
+    `input` group, no python-evdev): kitty itself never reports the release of
+    a plain left click, so this asks the kernel. The opened devices are kept on
+    the boss object -- this file is re-executed on every call."""
+    import time
+    try:
+        import evdev
+        from evdev import ecodes
+    except Exception:
+        return None
+    cache = getattr(boss, '_ide_pointer_devs', None)
+    now = time.monotonic()
+    if cache is None or now - cache[0] > 20:
+        for d in (cache[1] if cache else ()):
+            try:
+                d.close()
+            except Exception:
+                pass
+        devs = []
+        try:
+            for path in evdev.list_devices():
+                try:
+                    d = evdev.InputDevice(path)
+                    keys = d.capabilities().get(ecodes.EV_KEY, [])
+                    if ecodes.BTN_LEFT in keys or ecodes.BTN_TOUCH in keys:
+                        devs.append(d)
+                    else:
+                        d.close()
+                except Exception:
+                    continue
+        except Exception:
+            devs = []
+        cache = boss._ide_pointer_devs = (now, devs)
+    if not cache[1]:
+        return None
+    for d in cache[1]:
+        try:
+            active = d.active_keys()
+        except Exception:
+            boss._ide_pointer_devs = None       # a device went away: rescan next time
+            return None
+        if ecodes.BTN_LEFT in active or ecodes.BTN_TOUCH in active:
+            return True
+    return False
 
 
 def editable_box(rows, cy):
@@ -113,11 +163,17 @@ def plan(rows, cols, cur, target):
         row = rows[r1] if 0 <= r1 < len(rows) else ''
         x0 = max(min(x0, row_len_cells(row)), TEXT_COL)
     row = rows[r1] if 0 <= r1 < len(rows) else ''
-    if x1 < x0:
-        keys += ['left'] * presses_between(row, x1, x0)
-    elif x1 > x0:
-        keys += ['right'] * presses_between(row, x0, x1)
-    return keys
+    cells, cell = [], 0
+    for ch in row:
+        wd = cell_width(ch)
+        if wd <= 0:
+            if cells:
+                continue
+            wd = 1
+        if cell >= TEXT_COL:
+            cells.append((cell, ch))
+        cell += wd
+    return keys + row_keys(cells, max(cell, TEXT_COL), x0, x1)
 
 
 class CaretMove:
@@ -268,16 +324,41 @@ def handle_result(args, answer, target_window_id, boss):
             from kitty.utils import log_error
             log_error('ide-click: ' + traceback.format_exc())
         if w.user_vars.get('pane') == 'claude':
+            import time
+            t0 = time.monotonic()
+            cell0 = w.current_mouse_position()
+
             def later(timer_id=None):
+                # Is this press a click or the start of a drag? Moving the
+                # caret makes Claude repaint its input, and kitty drops a
+                # selection whose text is repainted -- so nothing may be sent
+                # while a drag could still begin. The physical button state
+                # (read from the input devices) settles it: released with no
+                # selection = a click, act at once.
                 try:
                     win = boss.window_id_map.get(target_window_id)
-                    if win is not None and not win.screen.has_selection():
+                    if win is None or win.screen.has_selection():
+                        return
+                    dt = time.monotonic() - t0
+                    down = _button_down(boss)
+                    still = win.current_mouse_position() == cell0
+                    if down is None:
+                        go = dt >= PRESS_WAIT            # can't tell: short fixed wait
+                    elif not down:
+                        go = True
+                    else:
+                        # held and not moving for a while: a slow click (or a
+                        # finger resting on the touchpad), not a drag
+                        go = still and dt >= HOLD_IS_CLICK
+                    if go:
                         place_caret(boss, win)
+                    elif dt < GIVE_UP and (down is None or down):
+                        add_timer(later, TICK, False)
                 except Exception:
                     import traceback
                     from kitty.utils import log_error
                     log_error('ide-click: ' + traceback.format_exc())
-            add_timer(later, PRESS_WAIT, False)
+            add_timer(later, TICK, False)
         return
     if w.user_vars.get('pane') != 'claude':
         w.mouse_handle_click('selection', 'link', 'prompt')

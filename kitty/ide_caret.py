@@ -14,7 +14,7 @@
 
 from kitty.fast_data_types import wcwidth
 
-VERSION = 3  # the kittens reload this module when the cached copy is older
+VERSION = 5  # the kittens reload this module when the cached copy is older
 
 
 def cell_width(ch):
@@ -43,6 +43,77 @@ def clusters(text):
         out.append((cell, w))
         cell += w
     return out
+
+
+def row_keys(cells, end, x0, x1):
+    """Fewest key presses that move Claude Code's caret from column x0 to x1
+    along one visual row. `cells` is [(column, char)] for the row's editable
+    characters and `end` the column just past the last one.
+
+    Besides left/right, Claude's input understands: home/end = start/end of the
+    VISUAL row; alt+b = back to the start of the previous run of letters/digits
+    (underscore and punctuation separate runs); alt+f = forward to the end of
+    the next such run. A breadth-first search over the row's caret positions
+    picks the shortest mix -- a move across a 140-column row is a handful of
+    presses instead of up to 140, which matters because the classic renderer
+    draws every single one. Jumps that would leave the row are not used."""
+    stops = [x for x, _ in cells] + [end]
+    if not cells or x0 == x1:
+        return []
+    start = stops[0]
+    x0 = min(max(x0, start), end)
+    x1 = min(max(x1, start), end)
+    idx = {x: i for i, x in enumerate(stops)}
+    if x0 not in idx:
+        x0 = max((x for x in stops if x <= x0), default=start)
+    if x1 not in idx:
+        x1 = max((x for x in stops if x <= x1), default=start)
+    if x0 == x1:
+        return []
+    word = [ch.isalnum() for _, ch in cells]
+    n = len(cells)
+    starts = [i for i in range(n) if word[i] and (i == 0 or not word[i - 1])]
+    ends = [i + 1 for i in range(n) if word[i] and (i == n - 1 or not word[i + 1])]
+
+    def moves(i):
+        if i == n + 1:
+            # just pressed `end`: on a wrapped row Claude parks the caret past
+            # the break (it shows at the next row's start), where `left` and
+            # `right` no longer mean what they do inside the row. Only a word
+            # jump back is predictable from here.
+            if starts:
+                yield 'alt+b', starts[-1]
+            return
+        if i > 0:
+            yield 'left', i - 1
+        if i < n:
+            yield 'right', i + 1
+        yield 'home', 0
+        yield 'end', n + 1
+        b = [s for s in starts if s < i]
+        if b:
+            yield 'alt+b', b[-1]
+        f = [e for e in ends if e > i]
+        if f:
+            yield 'alt+f', f[0]
+
+    a, goal = idx[x0], idx[x1]
+    prev = {a: None}
+    queue = [a]
+    while queue:
+        i = queue.pop(0)
+        if i == goal:
+            break
+        for key, j in moves(i):
+            if j not in prev:
+                prev[j] = (i, key)
+                queue.append(j)
+    keys = []
+    i = goal
+    while prev.get(i) is not None:
+        i, key = prev[i]
+        keys.append(key)
+    return keys[::-1]
 
 
 def presses_between(text, a, b):

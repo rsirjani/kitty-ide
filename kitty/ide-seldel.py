@@ -49,11 +49,11 @@ import json
 import os
 
 import ide_caret
-if getattr(ide_caret, 'VERSION', 0) < 3:   # kitty caches the module: pick up fixes live
+if getattr(ide_caret, 'VERSION', 0) < 5:   # kitty caches the module: pick up fixes live
     import importlib
     importlib.reload(ide_caret)
 from ide_caret import (
-    TEXT_COL, boundary_cost, cell_width, clusters, input_rows, logical_run,
+    TEXT_COL, boundary_cost, cell_width, clusters, input_rows, logical_run, row_keys,
     presses_between, presses_over, row_len_cells, snap_to_cluster, visual_rows,
 )
 
@@ -544,10 +544,8 @@ class Box:
         if r1 != r0:
             keys += ['up' if r1 < r0 else 'down'] * abs(r1 - r0)
             x0 = max(min(x0, self.row_end(r1)), TEXT_COL)
-        lo, hi = min(x0, x1), max(x0, x1)
-        n = sum(1 for c in self.cells if c[1] == r1 and lo <= c[2] < hi)
-        keys += ['left' if x1 < x0 else 'right'] * n
-        return keys
+        row = [(c[2], c[0]) for c in self.cells if c[1] == r1]
+        return keys + row_keys(row, self.row_end(r1), x0, x1)
 
     def after(self, i):
         """Cell position of the caret sitting just after cell i."""
@@ -1022,8 +1020,9 @@ def handle_result(args, answer, target_window_id, boss):
     w = boss.window_id_map.get(target_window_id)
     if w is None:
         return
-    _trace('seldel', args[1:], 'sel', w.screen.has_selection(), 'busy', getattr(w, '_ide_seldel_busy', 0) > 0,
-           'cur', (w.screen.cursor.y, w.screen.cursor.x))
+    if w.screen.has_selection():        # (not for every plain backspace)
+        _trace('seldel', args[1:], 'busy', getattr(w, '_ide_seldel_busy', 0) > 0,
+               'cur', (w.screen.cursor.y, w.screen.cursor.x))
     key = args[1] if len(args) > 1 else 'backspace'
     # An operation is in flight: swallow the key (a repeat, or a second press).
     # The flag lives on the Window -- kitty re-executes this file per call, so a
