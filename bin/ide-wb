@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# ide-wb — shared whiteboard between the user and Claude.
+#
+#   ide-wb open        start the server (if needed) + open the board as a
+#                      carbonyl tab in the editor zone
+#   ide-wb vd          open the board in the Virtual Desktop browser instead
+#                      (real mouse -> better freehand drawing)
+#   ide-wb send [-n]   paste "board updated, read board.png" into the claude
+#                      pane (auto-submits; -n pastes without submitting)
+#   ide-wb serve       just ensure the server is running
+#   ide-wb status      server + file state
+#   ide-wb clear       wipe the board (scene, mermaid layer, png)
+#   ide-wb stop        stop the server
+#
+# Protocol (also in ~/.claude/CLAUDE.md): the board lives in
+# ~/.local/state/ide-wb — Claude SEES it by Reading board.png and DRAWS by
+# editing board.mmd (mermaid flowchart). The open board page re-renders
+# Claude's layer on every .mmd save; parse errors appear in board.mmd.err.
+export PATH="$HOME/.local/bin:$PATH"
+
+PORT="${IDE_WB_PORT:-7223}"
+STATE="${IDE_WB_STATE:-$HOME/.local/state/ide-wb}"
+URL="http://127.0.0.1:$PORT"
+VD_URL="http://172.17.0.1:$PORT"   # docker bridge -> host, same convention as vd/
+
+alive() { curl -sf --max-time 1 "$URL/health" >/dev/null 2>&1; }
+
+serve() {
+  alive && return 0
+  mkdir -p "$STATE"
+  nohup _ide_wb_server.py >>"$STATE/server.log" 2>&1 &
+  for _ in $(seq 20); do alive && return 0; sleep 0.1; done
+  echo "ide-wb: server failed to start (see $STATE/server.log)" >&2
+  return 1
+}
+
+case "${1:-open}" in
+  serve) serve ;;
+  open)
+    serve || exit 1
+    exec ide-open browser "$URL" ;;
+  vd)
+    serve || exit 1
+    ide-vd open "$VD_URL" >/dev/null 2>&1 &
+    ide-pane vd >/dev/null 2>&1 || true ;;
+  send)
+    . ide-sock   # -> sock for THIS IDE instance
+    msg="[whiteboard] board updated — read $STATE/board.png"
+    [ -f "$STATE/board.png" ] || msg="$msg (png missing — open the board with 'ide-wb open' first)"
+    # scene newer than png => the page isn't open/saving, warn Claude
+    if [ -f "$STATE/board.excalidraw" ] && [ -f "$STATE/board.png" ] \
+       && [ "$(( $(stat -c %Y "$STATE/board.excalidraw") - $(stat -c %Y "$STATE/board.png") ))" -gt 5 ]; then
+      msg="$msg (png may be STALE — board tab not open?)"
+    fi
+    if [ "${2:-}" = "-n" ]; then
+      kitty @ --to "$sock" send-text --match var:pane=claude "$msg"
+    else
+      kitty @ --to "$sock" send-text --match var:pane=claude "$msg"$'\r'
+    fi ;;
+  status)
+    if alive; then echo "server: up ($URL)"; else echo "server: down"; fi
+    for f in board.excalidraw board.mmd board.png board.mmd.err; do
+      [ -f "$STATE/$f" ] && printf '%s\t%s\n' "$f" "$(stat -c '%y' "$STATE/$f" | cut -d. -f1)"
+    done ;;
+  clear)
+    mkdir -p "$STATE"
+    printf '{"type":"excalidraw","version":2,"elements":[],"appState":{},"files":{}}' \
+      > "$STATE/board.excalidraw"
+    : > "$STATE/board.mmd"
+    rm -f "$STATE/board.png" "$STATE/board.mmd.err"
+    echo "ide-wb: board cleared" ;;
+  stop)
+    pkill -f _ide_wb_server.py 2>/dev/null && echo "ide-wb: stopped" || echo "ide-wb: not running" ;;
+  *)
+    echo "usage: ide-wb [open|vd|send [-n]|serve|status|clear|stop]" >&2; exit 2 ;;
+esac

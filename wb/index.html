@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<!-- ide-wb wrapper page: Excalidraw board with two layers.
+     - user layer: anything drawn by hand in this page
+     - claude layer: elements generated from board.mmd (mermaid), tagged
+       customData.layer="claude", replaced wholesale on every .mmd change
+     The page is the only renderer/merger; the server just stores files.
+     It polls /state (1s): mmd change -> re-render claude layer; scene change
+     it didn't cause itself -> reload (e.g. `ide-wb clear`). Every save also
+     exports board.png so Claude can *see* the board with vision. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>whiteboard</title>
+<style>
+  html, body, #root { margin: 0; height: 100%; }
+  #err { position: fixed; z-index: 9; bottom: 0; left: 0; right: 0; display: none;
+         font: 12px monospace; color: #f38ba8; background: #1e1e2ecc; padding: 4px 8px; }
+</style>
+<script>window.EXCALIDRAW_ASSET_PATH = "https://unpkg.com/@excalidraw/excalidraw@0.17.6/dist/";</script>
+<script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@excalidraw/excalidraw@0.17.6/dist/excalidraw.production.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<div id="err"></div>
+<script type="module">
+import { parseMermaidToExcalidraw } from "https://esm.sh/@excalidraw/mermaid-to-excalidraw@1.1.0";
+
+const X = window.ExcalidrawLib;
+let api = null;
+let knownSceneVer = 0;   // scene versions this page wrote or already loaded
+let lastMmdVer = -1;     // -1 -> render claude layer once on startup
+let saveTimer = null;
+let lastSig = "";        // change signature, to skip no-op onChange floods
+
+const showErr = m => { const e = document.getElementById("err");
+  e.textContent = m || ""; e.style.display = m ? "block" : "none"; };
+
+const isClaude = el => el.customData && el.customData.layer === "claude";
+const bbox = els => !els.length ? null : {
+  minX: Math.min(...els.map(e => e.x)),
+  minY: Math.min(...els.map(e => e.y)),
+  maxX: Math.max(...els.map(e => e.x + (e.width || 0))),
+};
+
+async function save() {
+  const elements = api.getSceneElements().filter(e => !e.isDeleted);
+  const scene = { type: "excalidraw", version: 2, elements,
+    appState: { viewBackgroundColor: api.getAppState().viewBackgroundColor },
+    files: api.getFiles() };
+  const r = await fetch("/scene", { method: "POST", body: JSON.stringify(scene) });
+  knownSceneVer = (await r.json()).ver;
+  const blob = await X.exportToBlob({ elements, files: api.getFiles(),
+    mimeType: "image/png", exportPadding: 24,
+    appState: { exportWithDarkMode: false, exportBackground: true,
+                viewBackgroundColor: "#ffffff" } });
+  await fetch("/png", { method: "POST", body: blob });
+}
+
+// Replace the claude layer with a fresh render of the mermaid text. The layer
+// is re-anchored where it previously sat (so the user can drag Claude's whole
+// diagram somewhere and it stays there across re-renders); first render lands
+// right of the user's drawings.
+async function renderMermaid(text) {
+  const cur = api.getSceneElements().filter(e => !e.isDeleted);
+  const userEls = cur.filter(e => !isClaude(e));
+  if (!text.trim()) {
+    if (userEls.length !== cur.length) { api.updateScene({ elements: userEls }); await save(); }
+    return;
+  }
+  const { elements: skeleton, files } = await parseMermaidToExcalidraw(text);
+  let conv = X.convertToExcalidrawElements(skeleton, { regenerateIds: false });
+  conv = conv.map(e => ({ ...e, customData: { ...(e.customData || {}), layer: "claude" } }));
+  const prev = bbox(cur.filter(isClaude));
+  const user = bbox(userEls);
+  const anchor = prev ? { x: prev.minX, y: prev.minY }
+               : user ? { x: user.maxX + 120, y: user.minY }
+               : { x: 80, y: 80 };
+  const cb = bbox(conv);
+  if (cb) {
+    const dx = anchor.x - cb.minX, dy = anchor.y - cb.minY;
+    conv = conv.map(e => ({ ...e, x: e.x + dx, y: e.y + dy }));
+  }
+  if (files) api.addFiles(Object.values(files));
+  api.updateScene({ elements: [...userEls, ...conv] });
+  api.scrollToContent(undefined, { fitToContent: true });
+  await save();
+}
+
+function scheduleSave(elements) {
+  const sig = elements.length + ":" + elements.map(e => e.versionNonce).join(",");
+  if (sig === lastSig) return;
+  lastSig = sig;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => save().catch(e => showErr("save failed: " + e)), 800);
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch("/state")).json();
+    if (s.mmd !== lastMmdVer) {
+      lastMmdVer = s.mmd;
+      const text = await (await fetch("/mmd")).text();
+      try {
+        await renderMermaid(text);
+        await fetch("/mmd-status", { method: "POST", body: JSON.stringify({ ok: true }) });
+        showErr("");
+      } catch (err) {
+        const msg = String((err && err.message) || err);
+        await fetch("/mmd-status", { method: "POST",
+          body: JSON.stringify({ ok: false, error: msg }) });
+        showErr("board.mmd: " + msg);
+      }
+    }
+    if (s.scene !== knownSceneVer) {           // external write (e.g. ide-wb clear)
+      knownSceneVer = s.scene;
+      const sc = await (await fetch("/scene")).json();
+      api.updateScene({ elements: sc.elements || [] });
+    }
+  } catch (e) { /* server briefly down; retry next tick */ }
+}
+
+const scene = await (await fetch("/scene")).json();
+knownSceneVer = (await (await fetch("/state")).json()).scene;
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(X.Excalidraw, {
+  theme: "dark",
+  // NB: no custom viewBackgroundColor — the dark theme *inverts* colors, so a
+  // dark bg renders light (and default-dark strokes render faint on it). The
+  // default white bg displays dark under theme:"dark" and exports light.
+  initialData: { elements: scene.elements || [], files: scene.files || {} },
+  excalidrawAPI: a => {
+    api = a;
+    setInterval(poll, 1000);
+  },
+  onChange: els => { if (api) scheduleSave(els.filter(e => !e.isDeleted)); },
+}));
+</script>
+</body>
+</html>
