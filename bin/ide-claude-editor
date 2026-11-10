@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+$EDITOR for Claude Code inside the IDE -- a way to edit its input box exactly.
+
+Claude Code's input is keyboard-only; from outside, text can only be removed by
+simulating hundreds of arrow/delete presses, which the classic renderer draws
+one by one (you watch the caret walk). But Claude Code will hand its whole input
+to $EDITOR (Ctrl+G) and take back whatever the editor saves. So the IDE's
+select-to-delete kitten (kitty/ide-seldel.py) leaves a small request file,
+presses Ctrl+G, and this program -- standing in as the editor -- applies the
+edit to the real text in one step and exits. No travel, no guessing where a
+wrapped line hides a space.
+
+With no fresh request waiting (you pressed Ctrl+G yourself, or git wants a
+commit message) it simply becomes your real editor: $IDE_REAL_EDITOR, else nvim.
+
+Request  /tmp/ide-edit-<KITTY_PID>-<KITTY_WINDOW_ID>.json
+  {"op": "delete", "sig": "<the input's visible non-space characters>",
+   "start": n, "end": m, "lead": a, "trail": b}
+  -> delete from the (n+1)th through the m-th visible non-space character, plus
+     up to `a` spaces before and `b` after (the selection's own edge spaces).
+Result   <request>.done   {"ok": true} | {"ok": false, "why": "..."}
+The edit is refused unless `sig` matches the file exactly: then the screen and
+the text disagree (a pasted-text placeholder, say) and the kitten falls back to
+its slower, marker-verified method.
+"""
+import json, os, sys, time, unicodedata
+
+
+def visible(ch):
+    """Does the character occupy a cell (i.e. show up in the screen's text)?"""
+    if ch.isspace() or ch == '\xa0':
+        return False
+    return unicodedata.category(ch) not in ('Mn', 'Me', 'Cf', 'Cc')
+
+
+def main():
+    path = sys.argv[-1] if len(sys.argv) > 1 else ''
+    req_path = f"/tmp/ide-edit-{os.environ.get('KITTY_PID', '')}-{os.environ.get('KITTY_WINDOW_ID', '')}.json"
+    try:
+        fresh = time.time() - os.stat(req_path).st_mtime < 4
+    except OSError:
+        fresh = False
+    if not fresh or not path:
+        real = os.environ.get('IDE_REAL_EDITOR') or 'nvim'
+        os.execvp(real, [real] + sys.argv[1:])
+
+    def done(**res):
+        with open(req_path + '.done', 'w') as f:
+            json.dump(res, f)
+        try:
+            os.remove(req_path)
+        except OSError:
+            pass
+
+    try:
+        req = json.load(open(req_path))
+        text = open(path, encoding='utf-8').read()
+        vis = [i for i, ch in enumerate(text) if visible(ch)]
+        if ''.join(text[i] for i in vis) != req['sig']:
+            return done(ok=False, why='text differs from the screen')
+        n, m = req['start'], req['end']
+        if not 0 <= n < m <= len(vis):
+            return done(ok=False, why='range out of bounds')
+        a, b = vis[n], vis[m - 1]
+        lead, trail = req.get('lead', 0), req.get('trail', 0)
+        while lead > 0 and a > 0 and text[a - 1] in ' \t\xa0':
+            a -= 1
+            lead -= 1
+        while trail > 0 and b + 1 < len(text) and text[b + 1] in ' \t\xa0':
+            b += 1
+            trail -= 1
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text[:a] + text[b + 1:])
+        done(ok=True)
+    except Exception as e:
+        done(ok=False, why=repr(e))
+
+
+if __name__ == '__main__':
+    main()

@@ -14,7 +14,7 @@
 
 from kitty.fast_data_types import wcwidth
 
-VERSION = 2  # the kittens reload this module when the cached copy is older
+VERSION = 3  # the kittens reload this module when the cached copy is older
 
 
 def cell_width(ch):
@@ -92,8 +92,9 @@ def input_rows(rows, cy):
         if row[:1] == PROMPT:
             top = r
             break
-        if not row.startswith('  '):
+        if row.strip() and not row.startswith('  '):
             return None  # ran out of input-shaped rows before finding a prompt
+        # (a blank row is an empty line inside a multi-line input: keep looking)
     if top is None:
         return None
     bot = top

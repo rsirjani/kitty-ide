@@ -151,6 +151,7 @@ to `IgnorePkg` so the patch survives upgrades.
 | `kitty/ide-pin-tabbar.py` | watcher fallback that keeps a fixed strip (tab bar, claude header) one row |
 | `bin/ide-claude-header` | the one-row strip above claude that shows the current chat title |
 | `bin/ide-waybar-window` | Waybar module: focused window's title, or the chat title for IDE windows |
+| `bin/ide-claude-editor` | `$EDITOR` stand-in inside the IDE: lets select-to-delete edit Claude Code's input exactly via Ctrl+G; otherwise runs the real editor |
 | `kitty/ide-copy.py` | re-flows text copied from the claude pane (runtime hook on kitty's selection text) |
 | `kitty/ide-min.py` | minimizable panes: the runtime hook on kitty's splits layout (watcher) + the show/hide/toggle kitten |
 | `bin/ide-min` | CLI for the above: `ide-min show\|hide\|toggle explorer\|vd\|files [--auto]` |

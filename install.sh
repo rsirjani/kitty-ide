@@ -120,6 +120,9 @@ Notes:
    video/audio→mpv, csv/xlsx→visidata, docx/pptx→LibreOffice PDF, pdf→tdf, else
    nvim. Press Alt+M (or click the tab-bar ⇄) to morph rendered⇄editable.
  - PDF tabs use `tdf`; editing uses `nvim`.
+ - Instant select-to-delete in Claude Code: export EDITOR=ide-claude-editor (and
+   IDE_REAL_EDITOR=<your editor>) in shells inside the IDE, e.g. in ~/.zshrc:
+     [[ "$KITTY_LISTEN_ON" == *ide.sock-* ]] && export IDE_REAL_EDITOR=nvim EDITOR=ide-claude-editor VISUAL=ide-claude-editor
  - Waybar pane buttons (optional): `ide-waybar-panes config > ~/.config/waybar/ide-panes.jsonc`,
    add that file to the bar's "include", and put "group/ide-explorer", "group/ide-vd",
    "group/ide-files", "custom/ide-panes" in a modules list. Style the `.ide-pane`

@@ -45,8 +45,11 @@
 
 from kitty.fast_data_types import add_timer
 
+import json
+import os
+
 import ide_caret
-if getattr(ide_caret, 'VERSION', 0) < 2:   # kitty caches the module: pick up fixes live
+if getattr(ide_caret, 'VERSION', 0) < 3:   # kitty caches the module: pick up fixes live
     import importlib
     importlib.reload(ide_caret)
 from ide_caret import (
@@ -834,6 +837,159 @@ class MarkDel:
         return True
 
 
+# ---- editor-backed delete ------------------------------------------------------
+#
+# The fastest and exact way, when it is available: Claude Code hands its whole
+# input to $EDITOR on Ctrl+G. If that editor is bin/ide-claude-editor, a request
+# file tells it what to cut, and the edit happens on the real text in one step
+# -- no caret travel at all (which the classic renderer draws key by key).
+# Afterwards the caret, which Claude leaves at the end of the text, is walked to
+# where the cut was: rows by up/down, then at most a row of left presses.
+# Anything unexpected (editor not ours, text on screen doesn't match the real
+# text, no answer) falls back to MarkDel.
+EDIT_WAIT_TICKS = 190      # ~1.5s for the editor round trip
+
+
+def _editor_is_ours(w):
+    try:
+        for p in w.child.foreground_processes:
+            cmd = p.get('cmdline') or ['']
+            if os.path.basename(cmd[0]).startswith('claude'):
+                env = open(f"/proc/{p['pid']}/environ", 'rb').read().split(b'\0')
+                ed = [e.split(b'=', 1)[1] for e in env if e.startswith((b'VISUAL=', b'EDITOR='))]
+                return any(b'ide-claude-editor' in e for e in ed)
+    except Exception:
+        pass
+    return False
+
+
+class EditDel:
+    def __init__(self, boss, wid, sel_first, sel_last):
+        self.boss, self.wid = boss, wid
+        self.sel_first, self.sel_last = sel_first, sel_last
+        self.phase = 'start'
+        self.ticks = 0
+        self.last_sig, self.still = None, 0
+        self.req = f'/tmp/ide-edit-{os.getpid()}-{wid}.json'
+
+    def __call__(self, timer_id=None):
+        done = True
+        try:
+            done = self.tick()
+        except Exception:
+            import traceback
+            from kitty.utils import log_error
+            log_error('ide-seldel: ' + traceback.format_exc())
+        w = self.boss.window_id_map.get(self.wid)
+        if done:
+            if w is not None and self.phase != 'fallback':
+                w._ide_seldel_busy = 0
+        else:
+            add_timer(self, TICK, False)
+
+    def fallback(self, w, why):
+        _trace('  editdel fallback:', why)
+        self.phase = 'fallback'
+        add_timer(MarkDel(self.boss, self.wid, self.sel_first, self.sel_last), 0, False)
+        return True
+
+    def tick(self):
+        w = self.boss.window_id_map.get(self.wid)
+        self.ticks += 1
+        if w is None:
+            return True
+        if self.phase == 'start':
+            box = Box(w)
+            if not box.ok:
+                return True
+            cells = box.cells
+            fi = next((i for i, c in enumerate(cells) if (c[1], c[2]) >= self.sel_first), None)
+            li = next((i for i in range(len(cells) - 1, -1, -1) if (cells[i][1], cells[i][2]) <= self.sel_last), None)
+            if fi is None or li is None or fi > li:
+                return True
+            real = [i for i, c in enumerate(cells) if not _is_space(c[0])]
+            inside = [i for i in real if fi <= i <= li]
+            if not inside:
+                return self.fallback(w, 'only spaces selected')
+            start = real.index(inside[0])
+            self.k = start                       # real characters before the cut
+            # unselected spaces between the previous character and the cut
+            self.gap = 0
+            j = fi - 1
+            while j >= 0 and _is_space(cells[j][0]) and cells[j][1] == cells[fi][1]:
+                self.gap += 1
+                j -= 1
+            req = {'op': 'delete', 'sig': ''.join(cells[i][0] for i in real),
+                   'start': start, 'end': start + len(inside),
+                   'lead': inside[0] - fi, 'trail': li - inside[-1]}
+            try:
+                os.remove(self.req + '.done')
+            except OSError:
+                pass
+            with open(self.req, 'w') as f:
+                json.dump(req, f)
+            _trace('  editdel request', {k: v for k, v in req.items() if k != 'sig'})
+            w.send_key('ctrl+g')
+            self.phase = 'wait'
+            return False
+        if self.phase == 'wait':
+            try:
+                res = json.load(open(self.req + '.done'))
+            except (OSError, ValueError):
+                if self.ticks > EDIT_WAIT_TICKS:
+                    try:
+                        os.remove(self.req)
+                    except OSError:
+                        pass
+                    return self.fallback(w, 'no answer from the editor')
+                return False
+            try:
+                os.remove(self.req + '.done')
+            except OSError:
+                pass
+            if not res.get('ok'):
+                return self.fallback(w, res.get('why'))
+            _trace('  editdel done in', self.ticks, 'ticks')
+            self.phase = 'caret'
+            self.ticks = 0
+            return False
+        if self.phase == 'caret':
+            # wait for Claude to redraw the edited text, then walk the caret
+            # from the end of the text back to where the cut was
+            if self.ticks > 120:
+                return True
+            box = Box(w)
+            if not box.ok:
+                return False
+            sig = (box.cur, tuple(box.cells))
+            if sig != self.last_sig:
+                self.last_sig, self.still = sig, 0
+                return False
+            self.still += 1
+            if self.still < 3:
+                return False
+            cells = box.cells
+            i = 0
+            seen = 0
+            while i < len(cells) and seen < self.k:
+                if not _is_space(cells[i][0]):
+                    seen += 1
+                i += 1
+            gap = self.gap
+            while gap > 0 and i < len(cells) and _is_space(cells[i][0]) and i > 0 and cells[i][1] == cells[i - 1][1]:
+                i += 1
+                gap -= 1
+            if i >= len(cells):
+                return True                      # the cut was at the end: already there
+            target = box.after(i - 1) if (i > 0 and cells[i - 1][1] == cells[i][1]) else cells[i][1:]
+            keys = box.travel(box.cur, target)
+            _trace('  editdel caret', box.cur, '->', target, _summ(keys))
+            if keys:
+                w.send_key(*keys)
+            return True
+        return True
+
+
 def _summ(keys):
     out, prev, n = [], None, 0
     for k in list(keys) + [None]:
@@ -920,9 +1076,13 @@ def handle_result(args, answer, target_window_id, boss):
         return
     w._ide_seldel_busy = time.monotonic() + 12
     if box is not None:
-        # Claude's input box: marker-verified (see MarkDel)
+        # Claude's input box: through its editor hook when ours is installed
+        # (exact, no caret travel), else marker-verified key presses
         screen.clear_selection()
-        machine = MarkDel(boss, target_window_id, sel_first, sel_last)
+        if _editor_is_ours(w):
+            machine = EditDel(boss, target_window_id, sel_first, sel_last)
+        else:
+            machine = MarkDel(boss, target_window_id, sel_first, sel_last)
     else:
         plan = plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol)
         machine = SelDel(boss, target_window_id, sel_first, sel_last, cur, plan, tcol)

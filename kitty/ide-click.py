@@ -23,10 +23,10 @@
 from kitty.fast_data_types import add_timer, click_mouse_url
 
 import ide_caret
-if getattr(ide_caret, 'VERSION', 0) < 2:   # kitty caches the module: pick up fixes live
+if getattr(ide_caret, 'VERSION', 0) < 3:   # kitty caches the module: pick up fixes live
     import importlib
     importlib.reload(ide_caret)
-from ide_caret import TEXT_COL, input_rows, presses_over, row_len_cells, snap_to_cluster, visual_rows
+from ide_caret import TEXT_COL, input_rows, presses_between, row_len_cells, snap_to_cluster, visual_rows
 
 TICK = 0.008            # seconds between cursor polls
 PRESS_WAIT = 0.09       # a press not dragged into a selection by then is a click
@@ -101,19 +101,32 @@ def text_of(rows):
 
 
 def plan(rows, cols, cur, target):
-    """(arrow_key, n_presses) to move the caret from cur to target."""
-    if target < cur:
-        return 'left', presses_over(rows, cols, target, cur, TEXT_COL)
-    return 'right', presses_over(rows, cols, cur, target, TEXT_COL)
+    """The key presses that move the caret from cur to target. Rows are crossed
+    with up/down -- one press per row, where left/right would need a whole
+    row's worth each (and the classic renderer draws every one, so the caret
+    visibly crawls) -- then the column is closed on the target row. Claude
+    keeps the caret's column on a vertical move, clamped to the row's end."""
+    (r0, x0), (r1, x1) = cur, target
+    keys = []
+    if r1 != r0:
+        keys += ['up' if r1 < r0 else 'down'] * abs(r1 - r0)
+        row = rows[r1] if 0 <= r1 < len(rows) else ''
+        x0 = max(min(x0, row_len_cells(row)), TEXT_COL)
+    row = rows[r1] if 0 <= r1 < len(rows) else ''
+    if x1 < x0:
+        keys += ['left'] * presses_between(row, x1, x0)
+    elif x1 > x0:
+        keys += ['right'] * presses_between(row, x0, x1)
+    return keys
 
 
 class CaretMove:
-    def __init__(self, boss, window_id, target, lands, key, n):
+    def __init__(self, boss, window_id, target, lands, keys):
         self.boss = boss
         self.wid = window_id
         self.target = target
         self.lands = lands          # cells the caret may rest on once it arrives
-        self.key, self.n = key, n   # the next burst to send
+        self.keys = keys            # the next burst to send
         self.burst_sent = False
         self.burst_from = None
         self.text = None            # screen text when the burst went out
@@ -145,15 +158,15 @@ class CaretMove:
             return True
         pos = (w.screen.cursor.y, w.screen.cursor.x)
         if not self.burst_sent:
-            n = min(self.n, MAX_PRESSES - self.sent)
-            if n <= 0:
+            keys = self.keys[:max(MAX_PRESSES - self.sent, 0)]
+            if not keys:
                 return True
-            self.sent += n
+            self.sent += len(keys)
             self.burst_sent = True
             self.burst_from = self.last_pos = pos
             self.text = text_of(visual_rows(w))
             self.stable = self.settle = 0
-            w.send_key(*([self.key] * n))
+            w.send_key(*keys)
             return False
         # Judge where the caret comes to REST, not what a single poll shows:
         # claude coalesces repaints, so during a long burst the caret is drawn
@@ -181,8 +194,8 @@ class CaretMove:
             # the caret went, and moving it now would scatter their keystrokes.
             return True
         # landed elsewhere: the remaining distance is measurable now, close it
-        self.key, self.n = plan(without_caret_cell(rows, pos), w.screen.columns, pos, self.target)
-        if self.n <= 0:
+        self.keys = plan(without_caret_cell(rows, pos), w.screen.columns, pos, self.target)
+        if not self.keys:
             return True
         self.corrections += 1
         self.burst_sent = False
@@ -207,11 +220,12 @@ def place_caret(boss, w):
     target, lands = caret_target(rows, screen.columns, cy, cx, mouse['in_left_half_of_cell'])
     if cur in lands:
         return True
-    key, n = plan(rows, screen.columns, cur, target)
-    if n <= 0:
+    keys = plan(rows, screen.columns, cur, target)
+    if not keys:
         return True
+    _trace('  caret', cur, '->', target, len(keys), 'keys')
     setattr(w, BUSY_ATTR, True)
-    add_timer(CaretMove(boss, w.id, target, lands, key, n), 0, False)
+    add_timer(CaretMove(boss, w.id, target, lands, keys), 0, False)
     return True
 
 
