@@ -32,8 +32,12 @@ launch --location=vsplit --bias=28 --var pane=chat-header --var fixed_lines=1 --
 # (title_overridden), so we leave it free for the header/Waybar to read.
 # The ide-copy.py watcher installs the hook that re-flows text copied out of
 # Claude Code's output (it hard-wraps to the pane width) into clean paragraphs.
+# zsh is launched directly (not via `sh -c '…; exec zsh'`): kitty only injects
+# its shell integration into a shell it starts itself, and without it kitty
+# can't tell where the prompt is, so a click on the command line wouldn't move
+# the caret (ide-click.py).
 focus_matching_window var:pane=chat-header
-launch --location=hsplit --bias=97 --var pane=claude --var hlgroup=claude --watcher ide-copy.py --cwd=$HOME/projects sh -c 'export NO_ZELLIJ_AUTOSTART=1; exec zsh'
+launch --location=hsplit --bias=97 --var pane=claude --var hlgroup=claude --watcher ide-copy.py --cwd=$HOME/projects --env NO_ZELLIJ_AUTOSTART=1 zsh
 
 # editor zone BELOW the top band: tab-bar strip (top band keeps ~35% height)
 focus_matching_window var:pane=explorer
