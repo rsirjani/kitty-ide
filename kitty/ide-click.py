@@ -22,6 +22,10 @@
 
 from kitty.fast_data_types import add_timer, click_mouse_url
 
+import ide_caret
+if getattr(ide_caret, 'VERSION', 0) < 2:   # kitty caches the module: pick up fixes live
+    import importlib
+    importlib.reload(ide_caret)
 from ide_caret import TEXT_COL, input_rows, presses_over, row_len_cells, snap_to_cluster, visual_rows
 
 TICK = 0.008            # seconds between cursor polls

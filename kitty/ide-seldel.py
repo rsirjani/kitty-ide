@@ -45,8 +45,12 @@
 
 from kitty.fast_data_types import add_timer
 
+import ide_caret
+if getattr(ide_caret, 'VERSION', 0) < 2:   # kitty caches the module: pick up fixes live
+    import importlib
+    importlib.reload(ide_caret)
 from ide_caret import (
-    TEXT_COL, boundary_cost, clusters, input_rows, logical_run,
+    TEXT_COL, boundary_cost, cell_width, clusters, input_rows, logical_run,
     presses_between, presses_over, row_len_cells, snap_to_cluster, visual_rows,
 )
 
@@ -149,7 +153,9 @@ class SelDel:
             from kitty.utils import log_error
             log_error('ide-seldel: ' + traceback.format_exc())
         if done:
-            active.discard(self.wid)
+            w = self.boss.window_id_map.get(self.wid)
+            if w is not None:
+                w._ide_seldel_busy = 0
         else:
             add_timer(self, TICK, False)
 
@@ -404,6 +410,418 @@ def try_fast_path(w, sel_first, sel_last):
     return True
 
 
+# ---- marker-verified delete (Claude Code's input box) ------------------------
+#
+# The arithmetic above cannot be trusted across rows of Claude's input box: a
+# row break may or may not hide a character (a word wrap swallows a space, a
+# hard break of a long token hides nothing, and the two can look alike), and --
+# worse -- "the caret stopped moving" is not "Claude finished": a busy Claude
+# Code pauses mid-burst for longer than any sane timeout, and acting on that
+# pause deleted text in the wrong place.
+#
+# So for the box nothing is assumed. Keys are processed in order, so a typed
+# character that shows up on screen is proof every key before it was handled:
+#
+#   1. move to the end of the selection, type a marker, wait until it is ON
+#      SCREEN, and check it sits right after the last selected character
+#      (corrected and retried if not; removed and abandoned if it can't be);
+#   2. same at the start of the selection, with a second marker;
+#   3. forward-delete what is visibly between the two markers -- never more
+#      than is on screen, so the end marker cannot be overrun -- and repeat
+#      until they touch; then remove the markers.
+#
+# Worst case is a no-op (markers removed), not a wrong deletion.
+
+MARKS = '§¤¶‡†ǂ¦¬±µ'
+ACK_TICKS = 300        # ~2.4s for a marker to appear before giving up
+SETTLE_TICKS = 2       # frame unchanged this long before it is read
+DOUBT_TICKS = 15       # ...and this long before a marker is declared misplaced
+MAX_FIX = 2            # corrective moves per marker
+MAX_ROUNDS = 8         # delete rounds
+
+
+def _row_cells(row, r, tcol):
+    out, cell = [], 0
+    for ch in row:
+        wd = cell_width(ch)
+        if wd <= 0:
+            if out:
+                continue
+            wd = 1
+        if cell >= tcol:
+            out.append((ch, r, cell))
+        cell += wd
+    return out
+
+
+def _is_space(ch):
+    return ch in ' \xa0'
+
+
+class Box:
+    """The editable text of the input box as cells in reading order."""
+
+    def __init__(self, w, marks=''):
+        screen = w.screen
+        self.cols = screen.columns
+        self.cur = (screen.cursor.y, screen.cursor.x)
+        rows = visual_rows(w)
+        box = input_rows(rows, self.cur[0])
+        self.ok = box is not None
+        self.cells = []
+        if not self.ok:
+            return
+        self.top, self.bot = box
+        for r in range(self.top, self.bot + 1):
+            rc = _row_cells(rows[r], r, TEXT_COL)
+            # Claude draws the caret at the end of a row as a space cell
+            if rc and (r, rc[-1][2]) == self.cur and _is_space(rc[-1][0]):
+                rc.pop()
+            self.cells.extend(rc)
+        self.marks = marks
+
+    def find(self, mark):
+        hits = [i for i, c in enumerate(self.cells) if c[0] == mark]
+        return hits[0] if len(hits) == 1 else None
+
+    def is_mark(self, i):
+        return self.cells[i][0] in self.marks
+
+    def k_before(self, i):
+        """Real (non-space, non-marker) characters before point i."""
+        return sum(1 for j in range(i) if not _is_space(self.cells[j][0]) and not self.is_mark(j))
+
+    def caret_index(self):
+        for i, (_, r, x) in enumerate(self.cells):
+            if (r, x) >= self.cur:
+                return i
+        return len(self.cells)
+
+    def bcost(self, r):
+        """Guess: presses hidden in the break after row r. A word wrap swallowed
+        a space (1); a token too long for a line was hard-broken (0)."""
+        last = [c for c in self.cells if c[1] == r and c[0] not in self.marks]
+        nxt = [c for c in self.cells if c[1] == r + 1 and c[0] not in self.marks]
+        if not last or not nxt:
+            return 1
+        a = 0
+        for c in reversed(last):
+            if _is_space(c[0]):
+                break
+            a += 1
+        b = 0
+        for c in nxt:
+            if _is_space(c[0]):
+                break
+            b += 1
+        return 0 if a + b >= self.cols - TEXT_COL - 2 else 1
+
+    def presses(self, a, b):
+        """Estimated caret presses between points a <= b."""
+        n = b - a
+        for j in range(a, min(b, len(self.cells) - 1)):
+            if self.cells[j][1] != self.cells[j + 1][1]:
+                n += self.bcost(self.cells[j][1])
+        return n
+
+    def neighbour(self, i, step, row):
+        """Nearest non-marker cell from point i going left (-1) / right (+1),
+        if it is on `row`; else None."""
+        j = i - 1 if step < 0 else i
+        while 0 <= j < len(self.cells) and self.is_mark(j):
+            j += step
+        if 0 <= j < len(self.cells) and self.cells[j][1] == row:
+            return j
+        return None
+
+    def run(self, j, step):
+        """(length, hit_row_edge) of the run of spaces at j going `step`."""
+        row, n = self.cells[j][1], 0
+        while 0 <= j < len(self.cells) and self.cells[j][1] == row:
+            if self.is_mark(j):
+                j += step
+                continue
+            if not _is_space(self.cells[j][0]):
+                return n, False
+            n += 1
+            j += step
+        return n, True
+
+
+class Want:
+    """Where a marker must sit: after (side=-1) or before (side=+1) a given
+    character, identified by its ordinal among the box's real characters --
+    which survives any re-wrapping the marker itself causes."""
+
+    def __init__(self, box, i, side):
+        self.side = side
+        self.k = box.k_before(i)
+        row = box.cells[i - 1][1] if side < 0 else box.cells[i][1]
+        j = box.neighbour(i, side, row)
+        self.ch = box.cells[j][0]
+        self.run = box.run(j, side) if _is_space(self.ch) else None
+
+    def at(self, box, i, row):
+        if box.k_before(i) != self.k:
+            return False
+        j = box.neighbour(i, self.side, row)
+        if j is None:
+            return True          # at a row edge: the break may hide the rest
+        if box.cells[j][0] != self.ch and not (_is_space(box.cells[j][0]) and _is_space(self.ch)):
+            return False
+        if self.run is not None:
+            got = box.run(j, self.side)
+            if not got[1] and not self.run[1] and got[0] != self.run[0]:
+                return False
+        return True
+
+    def locate(self, box):
+        """A point on the current screen that satisfies this, or None."""
+        n = len(box.cells)
+        for i in range(n + 1):
+            if self.side < 0 and i == 0 or self.side > 0 and i == n:
+                continue
+            row = box.cells[i - 1][1] if self.side < 0 else box.cells[i][1]
+            if self.at(box, i, row):
+                return i
+        return None
+
+
+class MarkDel:
+    def __init__(self, boss, wid, sel_first, sel_last):
+        self.boss, self.wid = boss, wid
+        self.sel_first, self.sel_last = sel_first, sel_last
+        self.phase = 'start'
+        self.ticks = self.wait = 0
+        self.fixes = 0
+        self.rounds = 0
+        self.await_mark = None
+        self.used = ''
+        self.guards = 0        # markers sitting just left of the caret
+        self.last_sig, self.still = None, 0
+        self.mE = self.mS = None
+
+    def __call__(self, timer_id=None):
+        done = True
+        try:
+            done = self.tick()
+        except Exception:
+            import traceback
+            from kitty.utils import log_error
+            log_error('ide-seldel: ' + traceback.format_exc())
+        w = self.boss.window_id_map.get(self.wid)
+        if done:
+            if w is not None:
+                w._ide_seldel_busy = 0
+        else:
+            add_timer(self, TICK, False)
+
+    def log(self, *a):
+        if DEBUG:
+            from kitty.utils import log_error
+            log_error('seldel: ' + ' '.join(str(x) for x in a))
+
+    def new_mark(self, box):
+        present = {c[0] for c in box.cells}
+        for m in MARKS:
+            if m not in present and m not in self.used:
+                self.used += m
+                return m
+        return None
+
+    def send(self, w, keys=(), mark=None):
+        """Send keys then (optionally) a marker, and wait for the marker."""
+        self.log(self.phase, 'send', _summ(keys), 'mark', mark)
+        if keys:
+            w.send_key(*keys)
+        if mark:
+            w.write_to_child(mark.encode())
+            self.await_mark = mark
+            self.wait = 0
+        return False
+
+    def tick(self):
+        w = self.boss.window_id_map.get(self.wid)
+        self.ticks += 1
+        if w is None or self.ticks > MAX_TOTAL_TICKS:
+            return True
+        box = Box(w, self.used)
+        if not box.ok:
+            # a frame without the input box (mid-repaint): wait, don't bail
+            self.wait += 1
+            if self.wait > ACK_TICKS:
+                self.log('no input box on screen; giving up in phase', self.phase)
+            return self.wait > ACK_TICKS
+        if self.await_mark is not None:
+            if box.find(self.await_mark) is None:
+                self.wait += 1
+                if self.wait > ACK_TICKS:        # never showed up: stop, touch nothing
+                    self.log('marker', self.await_mark, 'never appeared in phase', self.phase)
+                return self.wait > ACK_TICKS
+            self.await_mark = None
+        # Only read a frame that has held still: Claude repaints in pieces, and
+        # a half-drawn box (marker present, text not yet reflowed, cursor parked
+        # elsewhere) must not be judged.
+        sig = (box.cur, tuple(box.cells))
+        if sig != self.last_sig:
+            self.last_sig, self.still = sig, 0
+        else:
+            self.still += 1
+        if self.still < SETTLE_TICKS:
+            return False
+        self.log('tick', self.phase, 'cur', box.cur, 'cells', len(box.cells))
+        return getattr(self, 'on_' + self.phase)(w, box)
+
+    # -- 1. end marker ----------------------------------------------------
+
+    def on_start(self, w, box):
+        cells = box.cells
+        fi = next((i for i, c in enumerate(cells) if (c[1], c[2]) >= self.sel_first), None)
+        li = next((i for i in range(len(cells) - 1, -1, -1) if (cells[i][1], cells[i][2]) <= self.sel_last), None)
+        if fi is None or li is None or fi > li:
+            return True
+        self.want_e = Want(box, li + 1, -1)
+        self.want_s = Want(box, fi, +1)
+        self.mE = self.new_mark(box)
+        if self.mE is None:
+            return True
+        ci = box.caret_index()
+        tgt = li + 1
+        keys = ['right'] * box.presses(ci, tgt) if tgt >= ci else ['left'] * box.presses(tgt, ci)
+        self.phase = 'end'
+        return self.send(w, keys, self.mE)
+
+    def on_end(self, w, box):
+        m = box.find(self.mE)
+        if self.want_e.at(box, m, box.cells[m][1]):
+            self.fixes = 0
+            self.mS = self.new_mark(box)
+            tgt = self.want_s.locate(box)
+            if self.mS is None or tgt is None or tgt > m:
+                self.send(w, ['backspace'])
+                return True
+            self.phase = 'begin'
+            return self.send(w, ['left'] * box.presses(tgt, m + 1), self.mS)
+        return self.fix(w, box, m, self.want_e, 'mE')
+
+    def fix(self, w, box, m, want, attr):
+        if self.still < DOUBT_TICKS:
+            return False     # be sure the frame is final before undoing anything
+        return self.refit(w, box, m, want, attr)
+
+    def refit(self, w, box, m, want, attr):
+        """The marker is in the wrong place: take it out, close the measured
+        gap, put a fresh one in. Out of tries -> take it out and stop."""
+        self.fixes += 1
+        tgt = want.locate(box)
+        new = self.new_mark(box) if (self.fixes <= MAX_FIX and tgt is not None) else None
+        if new is None:
+            return self.abandon(w, box, attr)
+        # after the backspace the caret is at point m of the list without it
+        if tgt > m:
+            keys = ['right'] * box.presses(m + 1, tgt)
+        else:
+            keys = ['left'] * box.presses(tgt, m)
+        setattr(self, attr, new)
+        return self.send(w, ['backspace'] + keys, new)
+
+    def abandon(self, w, box, attr):
+        self.log('abandon', attr)
+        if attr == 'mE':
+            self.send(w, ['backspace'])
+            return True
+        # the start marker failed: remove it, then go back and remove the end one
+        s, e = box.find(self.mS), box.find(self.mE)
+        probe = self.new_mark(box)
+        if e is None or s is None or probe is None:
+            self.send(w, ['backspace'])
+            return True
+        self.phase = 'cleanup'
+        self.mP = probe
+        return self.send(w, ['backspace'] + ['right'] * box.presses(s + 1, e + 1), probe)
+
+    def on_cleanup(self, w, box):
+        p, e = box.find(self.mP), box.find(self.mE)
+        if e is None:
+            self.send(w, ['backspace'])
+        elif p == e + 1:
+            self.send(w, ['backspace', 'backspace'])
+        elif p == e - 1:
+            self.send(w, ['backspace', 'delete'])
+        elif box.cells[p][1] == box.cells[e][1]:
+            # same row: the distance is exact
+            if p < e:
+                self.send(w, ['backspace'] + ['right'] * (e - p) + ['backspace'])
+            else:
+                self.send(w, ['backspace'] + ['left'] * (p - e - 1) + ['backspace'])
+        else:
+            self.send(w, ['backspace'])      # leave the stray end marker; undo removes it
+        return True
+
+    # -- 2. start marker --------------------------------------------------
+
+    def on_begin(self, w, box):
+        s = box.find(self.mS)
+        if self.want_s.at(box, s, box.cells[s][1]):
+            self.guards = 1
+            self.left = self.mS
+            self.phase = 'delete'
+            return self.on_delete(w, box)
+        return self.fix(w, box, s, self.want_s, 'mS')
+
+    # -- 3. delete between the markers -------------------------------------
+
+    def on_delete(self, w, box):
+        x, e = box.find(self.left), box.find(self.mE)
+        if x is None or e is None or e <= x:
+            return True
+        n = e - x - 1                      # cells visibly between caret and end marker
+        if box.cells[x][1] == box.cells[e][1]:
+            # same row: exact. Guards, the rest, and the end marker in one write.
+            self.send(w, ['backspace'] * self.guards + ['delete'] * (n + 1))
+            return True
+        self.rounds += 1
+        mark = self.new_mark(box)
+        if self.rounds > MAX_ROUNDS or mark is None:
+            return self.give_up_delete(w)
+        if n == 0:
+            # only a row break between them: does it hide a character? Step
+            # over it and see which side of the end marker we come out on.
+            self.phase = 'probe'
+            self.mP = mark
+            return self.send(w, ['right'], mark)
+        self.left = mark
+        self.guards += 1
+        return self.send(w, ['delete'] * n, mark)
+
+    def on_probe(self, w, box):
+        p, e = box.find(self.mP), box.find(self.mE)
+        if e is not None and p == e + 1:       # no hidden character
+            self.send(w, ['backspace'] * (2 + self.guards))
+        elif e is not None and p == e - 1:     # stepped over a hidden one
+            self.send(w, ['backspace'] * (2 + self.guards) + ['delete'])
+        else:
+            self.send(w, ['backspace'])
+        return True
+
+    def give_up_delete(self, w):
+        self.send(w, ['backspace'] * self.guards)
+        return True
+
+
+def _summ(keys):
+    out, prev, n = [], None, 0
+    for k in list(keys) + [None]:
+        if k == prev:
+            n += 1
+            continue
+        if prev is not None:
+            out.append(f'{prev}x{n}')
+        prev, n = k, 1
+    return ' '.join(out)
+
+
+
 def main(args):
     pass  # never runs: no_ui kittens only use handle_result (loader wants it)
 
@@ -413,8 +831,14 @@ def handle_result(args, answer, target_window_id, boss):
     if w is None:
         return
     key = args[1] if len(args) > 1 else 'backspace'
-    if target_window_id in active:
-        return  # an operation is in flight; swallow the repeat
+    # An operation is in flight: swallow the key (a repeat, or a second press).
+    # The flag lives on the Window -- kitty re-executes this file per call, so a
+    # module global would be fresh every time and the "repeat" would go through
+    # as a real backspace in the middle of the edit. It expires on its own in
+    # case an operation dies without clearing it.
+    import time
+    if getattr(w, '_ide_seldel_busy', 0) > time.monotonic():
+        return
     screen = w.screen
     sel = screen.current_selections() if screen.has_selection() else b''
     if not any(sel) or screen.is_rectangle_select() or screen.scrolled_by:
@@ -456,9 +880,14 @@ def handle_result(args, answer, target_window_id, boss):
         return
     if try_fast_path(w, sel_first, sel_last):
         return
-    plan = plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol)
-    machine = SelDel(boss, target_window_id, sel_first, sel_last, cur, plan, tcol)
-    active.add(target_window_id)
+    w._ide_seldel_busy = time.monotonic() + 12
+    if box is not None:
+        # Claude's input box: marker-verified (see MarkDel)
+        screen.clear_selection()
+        machine = MarkDel(boss, target_window_id, sel_first, sel_last)
+    else:
+        plan = plan_oneshot(rows, cols, cur, sel_first, sel_last, tcol)
+        machine = SelDel(boss, target_window_id, sel_first, sel_last, cur, plan, tcol)
     add_timer(machine, 0, False)
 
 

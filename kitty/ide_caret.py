@@ -14,12 +14,28 @@
 
 from kitty.fast_data_types import wcwidth
 
+VERSION = 2  # the kittens reload this module when the cached copy is older
+
+
+def cell_width(ch):
+    """Cells a character occupies: 0 for combining/zero-width, else 1 or 2.
+    kitty's wcwidth() answers with negative *classes* for some characters:
+    -1 is non-printing, but -2 is "East Asian ambiguous" -- é, §, curly
+    quotes, dashes, the ellipsis -- which kitty draws one cell wide. Reading
+    every negative as zero-width made any row containing one of those count
+    short, and the caret arithmetic drifted by one per such character."""
+    w = wcwidth(ord(ch))
+    if w < -1:
+        return 1
+    return max(w, 0)
+
+
 def clusters(text):
     """[(start_cell, cell_width)] per grapheme-ish cluster of a screen row."""
     out = []
     cell = 0
     for ch in text:
-        w = wcwidth(ord(ch))
+        w = cell_width(ch)
         if w <= 0:
             if out:
                 continue  # combining/zero-width: part of the previous cluster
