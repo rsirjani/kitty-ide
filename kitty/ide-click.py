@@ -222,6 +222,20 @@ def handle_result(args, answer, target_window_id, boss):
     w = boss.window_id_map.get(target_window_id)
     if w is None:
         return
+    if len(args) > 1 and args[1] == 'release':
+        # Fast path. kitty only reports a "click" once its double-click window
+        # (click_interval, ~half a second) has passed, which made every caret
+        # move feel laggy. The button release is reported at once, so the move
+        # starts here; the later click event then finds the caret already in
+        # place. A drag leaves a selection behind, and is left alone.
+        try:
+            if w.user_vars.get('pane') == 'claude' and not w.screen.has_selection():
+                place_caret(boss, w)
+        except Exception:
+            import traceback
+            from kitty.utils import log_error
+            log_error('ide-click: ' + traceback.format_exc())
+        return
     if w.user_vars.get('pane') != 'claude':
         w.mouse_handle_click('selection', 'link', 'prompt')
         return
